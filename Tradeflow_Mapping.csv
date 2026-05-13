@@ -1,0 +1,11 @@
+id,text
+"M","Import",
+"X","Export",
+"DX","Domestic Export",
+"FM","Foreign Import",
+"MIP","Import of goods for inward processing",
+"MOP","Import of goods after outward processing",
+"RM","Re-import",
+"RX","Re-export",
+"XIP","Export of goods after inward processing",
+"XOP","Export of goods for outward processing",
