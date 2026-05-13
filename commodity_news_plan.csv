@@ -1,0 +1,41 @@
+commodity,hs_code,sector,tier,token_cost,include_event_search,search_window
+"Crude oil",2709,"Energy",1,30,yes,5year
+"Natural gas",2711,"Energy",1,30,yes,5year
+"Gold",7108,"Metals",1,30,yes,5year
+"Iron ore",2601,"Metals",1,30,yes,5year
+"Soybeans",1201,"Ag grains",1,30,yes,5year
+"Copper",7403,"Metals",1,30,yes,5year
+"Wheat",1001,"Ag grains",1,30,yes,5year
+"Coal",2701,"Energy",1,30,yes,5year
+"Palm oil",1511,"Ag oils",1,30,yes,5year
+"Corn / Maize",1005,"Ag grains",1,30,yes,5year
+"Aluminum",7601,"Metals",1,30,yes,5year
+"Steel (flat products)",7208,"Metals",1,30,yes,5year
+"Cotton",5201,"Ag fibers",1,30,yes,5year
+"Coffee",0901,"Ag food",1,30,yes,5year
+"Liquefied petroleum gas",2711.12,"Energy",1,30,yes,5year
+"Rice",1006,"Ag grains",2,25,no,5year
+"Nickel",7502,"Metals",2,25,no,5year
+"Zinc",7901,"Metals",2,25,no,5year
+"Lead",7801,"Metals",2,25,no,5year
+"Tin",8001,"Metals",2,25,no,5year
+"Silver",7106,"Metals",2,25,no,5year
+"Platinum",7110,"Metals",2,25,no,5year
+"Rubber (natural)",4001,"Ag industrial",2,25,no,5year
+"Sugar (raw)",1701,"Ag food",2,25,no,5year
+"Cocoa",1801,"Ag food",2,25,no,5year
+"Tea",0902,"Ag food",2,25,no,5year
+"Sunflower oil",1512,"Ag oils",2,25,no,5year
+"Soybean oil",1507,"Ag oils",2,25,no,5year
+"Rapeseed / Canola",1205,"Ag oilseeds",2,25,no,5year
+"Beef",0201,"Ag livestock",2,25,no,5year
+"Pork",0203,"Ag livestock",2,25,no,5year
+"Poultry",0207,"Ag livestock",2,25,no,5year
+"Fishmeal",2301.20,"Ag marine",2,25,no,5year
+"Uranium",2844,"Energy",2,25,no,5year
+"Potash (fertilizer)",3104,"Ag inputs",2,25,no,5year
+"Urea (fertilizer)",3102.10,"Ag inputs",2,25,no,5year
+"Phosphate rock",2510,"Ag inputs",2,25,no,5year
+"Lithium carbonate",2836.91,"Metals",2,25,no,5year
+"Cobalt",8105,"Metals",2,25,no,5year
+"Manganese",2602,"Metals",2,25,no,5year
