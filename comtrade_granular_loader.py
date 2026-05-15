@@ -137,6 +137,15 @@ SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1.0"))
 RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "4"))
 RETRY_BACKOFF_SECONDS = float(os.getenv("RETRY_BACKOFF_SECONDS", "5.0"))
 
+# Max URL-encoded length for the cmdCode query-param VALUE.  The
+# Comtrade server rejects URLs over 2000 chars total.  urllib3
+# percent-encodes commas as "%2C" (1 byte -> 3), so 200 6-digit
+# codes joined with commas balloon from 1399 raw chars to 1797 in
+# the URL.  Budget 1600 chars of URL-encoded value here, which
+# leaves ~250 chars of headroom for the base URL + other params +
+# the subscription key.
+MAX_CMDCODE_URL_CHARS = int(os.getenv("MAX_CMDCODE_URL_CHARS", "1600"))
+
 # --- Optional reporter filter for test runs ---
 REPORTER_CODES_ENV = os.getenv("REPORTER_CODES")
 
@@ -157,6 +166,11 @@ DB_NAME = os.getenv("DB_NAME")
 
 # --- Country mapping file (from your project) ---
 COUNTRY_MAPPING_CSV = os.getenv("COUNTRY_MAPPING_CSV", "Country_Mapping_Data.csv")
+
+# --- Commodity mapping file (required for AG6 chapter subdivision) ---
+COMMODITY_MAPPING_CSV = os.getenv(
+    "COMMODITY_MAPPING_CSV", "Commodity_Code_Mapping.csv"
+)
 
 
 # ----------------------------------------------------------------------
@@ -267,7 +281,7 @@ def get_reporter_codes() -> list[str]:
     project_path = Path(COUNTRY_MAPPING_CSV)
     if project_path.exists():
         df = pd.read_csv(project_path, encoding="cp1252", engine="python",
-                         on_bad_lines="skip")
+                         on_bad_lines="skip", index_col=False)
         # The project file has an unusual layout: column 'id' holds the
         # numeric M49 code (as string).  isGroup=false means real country.
         code_col = "reporterCode" if "reporterCode" in df.columns else "id"
@@ -493,14 +507,28 @@ class DailyQuotaExceeded(RuntimeError):
     """Raised when the API rejects further calls for the day."""
 
 
+class NonRetryableClientError(RuntimeError):
+    """Raised for client-side errors that won't fix themselves on retry
+    (e.g. URL exceeds maximum length).  Skips the backoff loop."""
+
+
 _QUOTA_PATTERNS = re.compile(
     r"(429|quota|rate.?limit|too many requests|subscription)",
+    flags=re.IGNORECASE,
+)
+
+_URL_TOO_LONG_PATTERNS = re.compile(
+    r"(url.{0,20}(exceed|too long|maximum.{0,10}length)|414)",
     flags=re.IGNORECASE,
 )
 
 
 def _looks_like_quota_error(exc: BaseException) -> bool:
     return bool(_QUOTA_PATTERNS.search(repr(exc)))
+
+
+def _looks_like_url_too_long(exc: BaseException) -> bool:
+    return bool(_URL_TOO_LONG_PATTERNS.search(repr(exc)))
 
 
 def fetch_once(
@@ -570,6 +598,8 @@ def fetch_with_retries(
             last_exc = exc
             if _looks_like_quota_error(exc):
                 raise DailyQuotaExceeded(repr(exc)) from exc
+            if _looks_like_url_too_long(exc):
+                raise NonRetryableClientError(repr(exc)) from exc
             if attempt >= RETRY_ATTEMPTS:
                 break
             wait = RETRY_BACKOFF_SECONDS * attempt
@@ -590,7 +620,95 @@ def fetch_with_retries(
 # OVERFLOW SUBDIVISION
 # ----------------------------------------------------------------------
 
-HS_CHAPTERS = [f"{i:02d}" for i in range(1, 100)]   # '01'..'99'
+# When AG6 + all partners overflows the 100k cap, we refetch the data
+# in batches of 6-digit leaf codes.
+#
+# Two failure modes the naive approach hit:
+#   1. cmdCode="01" returns the aggregate row for chapter 01, not the
+#      6-digit detail beneath it.  So we must pass actual leaf codes.
+#   2. The Comtrade client enforces a 2000-char URL limit.  Big
+#      chapters (84 = 597 codes, 29 = 489 codes, 03 = 282 codes) all
+#      bust that ceiling when joined comma-separated.
+#
+# Solution: pack all 6,897 leaf codes (from Commodity_Code_Mapping.csv)
+# into URL-length-safe batches.  At ~7 chars/code and a 1500-char
+# cmdCode budget, that's ~33 batches per truncated chunk.
+
+_LEAF_CODE_BATCHES: Optional[list[list[str]]] = None
+
+
+def _pack_codes_into_batches(
+    codes: list[str], max_url_value_chars: int
+) -> list[list[str]]:
+    """Pack codes into batches whose URL-ENCODED length <= the budget.
+
+    urllib3 percent-encodes commas as "%2C" (3 bytes each) when
+    building the query string, so each separator costs 3 chars in the
+    actual URL, not 1.  Encoded length of a batch:
+        sum(len(code)) + 3 * (n - 1)
+    """
+    batches: list[list[str]] = []
+    current: list[str] = []
+    current_len = 0
+    for code in codes:
+        # +3 accounts for the URL-encoded comma separator (%2C),
+        # skipped on the first item of a batch.
+        add = len(code) + (3 if current else 0)
+        if current_len + add > max_url_value_chars and current:
+            batches.append(current)
+            current = [code]
+            current_len = len(code)
+        else:
+            current.append(code)
+            current_len += add
+    if current:
+        batches.append(current)
+    return batches
+
+
+def get_leaf_code_batches() -> list[list[str]]:
+    """Return all 6-digit HS leaf codes packed into URL-safe batches."""
+    global _LEAF_CODE_BATCHES
+    if _LEAF_CODE_BATCHES is not None:
+        return _LEAF_CODE_BATCHES
+
+    path = Path(COMMODITY_MAPPING_CSV)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found.  Subdivision needs the leaf-code mapping; "
+            "point COMMODITY_MAPPING_CSV at the project's "
+            "Commodity_Code_Mapping.csv."
+        )
+
+    df = pd.read_csv(path, encoding="cp1252", dtype=str, index_col=False)
+    leaves = (
+        df.loc[df["aggrLevel"].astype(str) == "6", "id"]
+        .dropna()
+        .astype(str)
+        .tolist()
+    )
+    leaves = sorted({c for c in leaves if len(c) == 6 and c.isdigit()})
+
+    if not leaves:
+        raise RuntimeError(
+            "No leaf codes loaded from Commodity_Code_Mapping.csv -- "
+            "check the file's aggrLevel column."
+        )
+
+    batches = _pack_codes_into_batches(leaves, MAX_CMDCODE_URL_CHARS)
+    _LEAF_CODE_BATCHES = batches
+    longest_encoded = max(
+        sum(len(c) for c in b) + 3 * (len(b) - 1) for b in batches
+    )
+    logger.info(
+        "Leaf-code batches ready: %d batches, %d total codes "
+        "(avg %.0f codes/batch, longest URL-encoded value %d chars, "
+        "limit %d).",
+        len(batches), len(leaves),
+        len(leaves) / len(batches),
+        longest_encoded, MAX_CMDCODE_URL_CHARS,
+    )
+    return batches
 
 
 def fetch_chunk(
@@ -602,11 +720,16 @@ def fetch_chunk(
 ) -> tuple[pd.DataFrame, int, bool]:
     """Fetch a (period, reporter, flow) chunk at CMD_CODE granularity.
 
-    If the first call hits MAX_RECORDS exactly, the chunk is presumed
-    truncated; the loader subdivides by HS chapter and concatenates.
+    If the first call hits MAX_RECORDS exactly (likely truncated), the
+    chunk is refetched in URL-length-safe leaf-code batches.
 
     Returns:
-        (dataframe, total_api_calls, was_subdivided)
+        (dataframe, total_api_calls, was_truncated)
+
+        was_truncated=True means at least one sub-batch STILL hit the
+        cap (data is partially missing -- a single batch returned
+        >= MAX_RECORDS rows, suggesting that batch needs finer
+        partitioning, e.g. per-partner).
     """
     df, n_calls = fetch_with_retries(
         period=period,
@@ -616,47 +739,78 @@ def fetch_chunk(
         budget=budget,
     )
 
-    # If the response is below the cap, we're done.
     if len(df) < MAX_RECORDS:
         return df, n_calls, False
 
+    if CMD_CODE != "AG6":
+        logger.warning(
+            "Truncation hit but CMD_CODE=%r is not AG6 -- "
+            "returning truncated result.", CMD_CODE,
+        )
+        return df, n_calls, True
+
     logger.warning(
         "period=%s reporter=%s flow=%s hit MAX_RECORDS=%d -- "
-        "subdividing by HS chapter.",
+        "subdividing into leaf-code batches.",
         period, reporter_code, flow_code, MAX_RECORDS,
     )
 
+    batches = get_leaf_code_batches()
     pieces: list[pd.DataFrame] = []
     total_calls = n_calls
-    # Only chapter-level subdivision when CMD_CODE was AG6.  For other
-    # cmd_codes (e.g. a specific 6-digit), truncation is unexpected --
-    # we just return what we got and flag truncated.
-    if CMD_CODE != "AG6":
-        return df, n_calls, True
+    truncated_batches: list[int] = []
 
-    for chapter in HS_CHAPTERS:
+    for idx, batch in enumerate(batches, 1):
         if remaining_budget(budget) <= 0:
             raise DailyQuotaExceeded(
-                "Budget exhausted during chapter subdivision."
+                "Budget exhausted during leaf-code subdivision."
             )
+
+        cmd_filter = ",".join(batch)
         try:
             sub_df, sub_calls = fetch_with_retries(
                 period=period,
                 reporter_code=reporter_code,
                 flow_code=flow_code,
-                cmd_code=chapter,
+                cmd_code=cmd_filter,
                 budget=budget,
             )
         except DailyQuotaExceeded:
             raise
+        except NonRetryableClientError as exc:
+            logger.error(
+                "Batch %d/%d (%s..%s) hit a non-retryable client error "
+                "for period=%s reporter=%s flow=%s: %r  "
+                "Reduce MAX_CMDCODE_URL_CHARS and rerun.",
+                idx, len(batches), batch[0], batch[-1],
+                period, reporter_code, flow_code, exc,
+            )
+            total_calls += 1
+            truncated_batches.append(idx)
+            continue
         except Exception as exc:
             logger.warning(
-                "Sub-chapter %s failed for period=%s reporter=%s flow=%s: %r",
-                chapter, period, reporter_code, flow_code, exc,
+                "Batch %d/%d (%s..%s) failed for period=%s reporter=%s "
+                "flow=%s: %r",
+                idx, len(batches), batch[0], batch[-1],
+                period, reporter_code, flow_code, exc,
             )
             total_calls += 1
             continue
+
         total_calls += sub_calls
+
+        if len(sub_df) >= MAX_RECORDS:
+            logger.warning(
+                "Batch %d/%d (%s..%s) for period=%s reporter=%s flow=%s "
+                "ALSO hit the cap -- data within this batch is "
+                "truncated.  Consider per-partner subdivision for this "
+                "reporter.",
+                idx, len(batches), batch[0], batch[-1],
+                period, reporter_code, flow_code,
+            )
+            truncated_batches.append(idx)
+
         if not sub_df.empty:
             pieces.append(sub_df)
         time.sleep(SLEEP_SECONDS)
@@ -664,7 +818,7 @@ def fetch_chunk(
     combined = (
         pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame()
     )
-    return combined, total_calls, True
+    return combined, total_calls, bool(truncated_batches)
 
 
 # ----------------------------------------------------------------------
@@ -900,8 +1054,7 @@ def main() -> None:
             "period": job.period, "reporter_code": job.reporter_code,
             "flow_code": job.flow_code,
             "partner_code": str(PARTNER_CODE) if PARTNER_CODE else "ALL",
-            "status": "truncated" if subdivided and CMD_CODE != "AG6"
-                      else "success",
+            "status": "truncated" if subdivided else "success",
             "rows": str(len(cleaned)),
             "n_api_calls": str(n_calls),
             "chunk_id": chunk_id,
