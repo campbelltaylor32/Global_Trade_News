@@ -127,64 +127,106 @@ def load_unit_quantity(engine, csv_path: Path) -> int:
     return len(records)
 
 
-def load_country(engine, csv_path: Path) -> int:
-    """Country mapping has variable column counts.
+def _looks_like_iso_alpha(value: str, length: int) -> bool:
+    """True if value is exactly `length` characters of ASCII letters."""
+    if value is None:
+        return False
+    v = value.strip()
+    if len(v) != length:
+        return False
+    return all(c.isascii() and c.isalpha() for c in v)
 
-    Header: id, text, reporterCode, reporterDesc, reporterNote,
-            ISO2, ISO3, entryEffectiveDate, isGroup
-    But some rows have entryExpiredDate inserted between
-    entryEffectiveDate and isGroup, so we read positionally based on
-    field count.
+
+def _looks_like_date(value: str) -> bool:
+    return _parse_dt(value) is not None
+
+
+def load_country(engine, csv_path: Path) -> int:
+    """Country mapping has inconsistent column counts.
+
+    Three observed shapes (after stripping the trailing-comma noise):
+        8 fields:  reporterNote missing or iso3 missing
+        9 fields:  standard layout matching the header
+        10 fields: extra entryExpiredDate inserted before isGroup
+
+    Field positions also shift when reporterNote or iso3 is missing.
+    Rather than guessing positions, this parser locks down columns by
+    content: isGroup is the last field (true/false), iso codes are
+    pure ASCII letters of length 2/3, dates parse with fromisoformat,
+    and the leading 4 fields (id, text, reporterCode, reporterDesc)
+    are stable.
+
+    ISO codes that don't pass strict validation (e.g. '_ZP', 'R4 ',
+    or stray dates in the iso3 column) are stored as NULL rather than
+    rejected -- this prevents data-too-long errors and keeps the
+    country row.
     """
     _, rows = _read_csv(csv_path, encoding="cp1252")
     records = []
-    for r in rows:
-        # Strip trailing empty fields produced by the trailing comma.
+    for raw in rows:
+        # Strip trailing empties (the file ends every row with ",")
+        r = list(raw)
         while r and r[-1] == "":
             r = r[:-1]
-        if len(r) < 7 or not r[0].strip():
+        if len(r) < 6 or not r[0].strip():
             continue
 
-        # Position 0..6 are stable: id, text, reporterCode,
-        # reporterDesc, reporterNote, ISO2, ISO3.
-        # Some rows omit reporterNote -> 6 stable cols and shift.
-        # Heuristic: ISO2 is always 2 chars, ISO3 is always 3 chars.
-        # Find ISO2 by scanning for a 2-char alpha field.
-        iso2_idx = None
-        for i in range(2, min(len(r) - 1, 6)):
-            if len(r[i].strip()) == 2 and r[i].strip().isalpha():
-                iso2_idx = i
-                break
-        if iso2_idx is None:
-            # Fallback to header positions
-            iso2_idx = 5
-
+        # Locked-down head: 4 fields always present
         country_code = r[0].strip()
         country_text = r[1].strip()
-        reporter_note = r[4].strip() if iso2_idx >= 5 else None
-        iso2 = r[iso2_idx].strip() if iso2_idx < len(r) else None
-        iso3 = r[iso2_idx + 1].strip() if iso2_idx + 1 < len(r) else None
+        # r[2] is duplicate reporterCode, r[3] is duplicate reporterDesc
 
-        # Dates: starting after ISO3
-        rem = r[iso2_idx + 2:]
-        entry_effective = _parse_dt(rem[0]) if len(rem) >= 1 else None
+        # Locked-down tail: isGroup is the last field
+        is_group = _parse_bool(r[-1])
+
+        # Middle = r[4:-1].  Walk it pulling out: reporter_note,
+        # iso2, iso3, entry_effective_date, entry_expired_date.
+        middle = [v.strip() for v in r[4:-1]]
+
+        # Pull dates off the right end first (most reliable signal).
+        entry_effective = None
         entry_expired = None
-        is_group = 0
+        while middle and _looks_like_date(middle[-1]):
+            d = _parse_dt(middle.pop())
+            if entry_expired is None:
+                entry_expired = d
+            else:
+                # second date going right-to-left is the effective date,
+                # the one we already popped is the expired date
+                entry_effective = d
+        if entry_effective is None and entry_expired is not None:
+            # Only one date present -> it's the effective date, not expired
+            entry_effective = entry_expired
+            entry_expired = None
 
-        if len(rem) == 2:
-            # entryEffective, isGroup
-            is_group = _parse_bool(rem[1])
-        elif len(rem) >= 3:
-            # entryEffective, entryExpired, isGroup
-            entry_expired = _parse_dt(rem[1])
-            is_group = _parse_bool(rem[2])
+        # What remains in `middle` is: [reporter_note?, iso2?, iso3?]
+        # Detect iso codes by content.
+        iso2 = None
+        iso3 = None
+        # Scan from the right for an iso3 (3 alpha), then iso2 (2 alpha)
+        # Use indexes so we can splice them out cleanly.
+        i = len(middle) - 1
+        while i >= 0:
+            if iso3 is None and _looks_like_iso_alpha(middle[i], 3):
+                iso3 = middle.pop(i)
+                i -= 1
+                continue
+            if iso2 is None and _looks_like_iso_alpha(middle[i], 2):
+                iso2 = middle.pop(i)
+                i -= 1
+                continue
+            i -= 1
+
+        # Anything still in `middle` is reporter_note (or junk we
+        # don't want -- but for this dataset it's reporter_note).
+        reporter_note = " ".join(middle).strip() or None
 
         records.append({
             "country_code": country_code,
             "country_text": country_text,
             "reporter_note": reporter_note,
-            "iso_alpha_2": iso2 or None,
-            "iso_alpha_3": iso3 or None,
+            "iso_alpha_2": iso2,
+            "iso_alpha_3": iso3,
             "entry_effective_date": entry_effective,
             "entry_expired_date": entry_expired,
             "is_group": is_group,
