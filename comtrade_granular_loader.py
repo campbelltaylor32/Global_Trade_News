@@ -91,6 +91,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
+from sqlalchemy import text
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 
 import pandas as pd
 import comtradeapicall
@@ -163,6 +165,20 @@ DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 DB_HOST = os.getenv("DB_HOST")
 DB_NAME = os.getenv("DB_NAME")
+
+FACT_TABLE = os.getenv("FACT_TABLE", "fact_trade_granular")
+
+# --- Master CSV output ---
+# Defaults to True for backward compatibility.  Set to False in .env
+# to skip CSV writes entirely (MySQL becomes the only sink).
+WRITE_MASTER_CSV = os.getenv("WRITE_MASTER_CSV", "true").lower() == "true"
+
+# Sanity check: data must flow somewhere.
+if not WRITE_MASTER_CSV and not LOAD_TO_MYSQL:
+    raise ValueError(
+        "Both WRITE_MASTER_CSV and LOAD_TO_MYSQL are disabled -- "
+        "results would have nowhere to go.  Enable at least one."
+    )
 
 # --- Country mapping file (from your project) ---
 COUNTRY_MAPPING_CSV = os.getenv("COUNTRY_MAPPING_CSV", "Country_Mapping_Data.csv")
@@ -827,6 +843,8 @@ def fetch_chunk(
 
 def append_to_master(df: pd.DataFrame) -> None:
     """Append cleaned rows to the single master CSV (header only once)."""
+    if not WRITE_MASTER_CSV:
+        return
     if df.empty:
         return
     header = not MASTER_CSV.exists()
@@ -839,6 +857,8 @@ def remove_chunk_rows_from_master(chunk_id: str) -> int:
     Used when restarting a chunk whose previous run crashed mid-append.
     Returns the number of rows removed.
     """
+    if not WRITE_MASTER_CSV:
+        return 0
     if not MASTER_CSV.exists():
         return 0
     # Stream the file to avoid loading everything if it's huge.
@@ -871,22 +891,281 @@ def get_engine():
     if missing:
         raise ValueError(f"LOAD_TO_MYSQL=true but missing env vars: {missing}")
     from sqlalchemy import create_engine
+    from urllib.parse import quote_plus
+    user = quote_plus(DB_USER)
+    pw   = quote_plus(DB_PASS)
+    host = DB_HOST
+    port = os.getenv("DB_PORT", "3306")
     return create_engine(
-        f"mysql+mysqlconnector://{DB_USER}:{DB_PASS}@{DB_HOST}/{DB_NAME}"
+        f"mysql+mysqlconnector://{user}:{pw}@{host}:{port}/{DB_NAME}", 
+        pool_pre_ping=True,
+        pool_recycle=3600,
     )
+
+
+# Columns that have a SQL DEFAULT and are FK-constrained.  pandas
+# to_sql sends explicit NULLs, which override the DEFAULT, so we
+# coerce blanks/NaN to the documented sentinel value before insert.
+FK_DEFAULTS = {
+    "partner2_code": "0",
+    "mot_code": "0",
+    "customs_code": "C00",
+}
+
+
+def _ensure_parent_rows(engine, df: pd.DataFrame) -> None:
+    """Insert placeholder rows into mapping tables for any code that
+    appears in the fact data but not in the reference table.
+
+    Why: the Comtrade API occasionally returns codes that are not in
+    the published mapping CSV (newer HS revisions, "Areas n.e.s.",
+    etc.).  Strict FKs would reject those rows.  Rather than dropping
+    data, we insert a placeholder with text='UNKNOWN (<code>)' so the
+    fact insert succeeds.  The placeholders can be replaced later
+    when the official mapping is refreshed.
+    """
+    from sqlalchemy import text
+
+    def codes(col: str) -> set[str]:
+        if col not in df.columns:
+            return set()
+        s = df[col].dropna().astype(str)
+        s = s[(s != "") & (s.str.lower() != "nan") & (s.str.lower() != "none")]
+        return set(s.unique())
+
+    # (fact_column, parent_table, parent_pk, placeholder_text_column,
+    #  extra_required_cols)
+    fk_specs = [
+        ("reporter_code", "country_mapping", "country_code",
+            "country_text", {}),
+        ("partner_code",  "country_mapping", "country_code",
+            "country_text", {}),
+        ("partner2_code", "country_mapping", "country_code",
+            "country_text", {}),
+        ("cmd_code",      "commodity_code_mapping", "cmd_code",
+            "cmd_text", {"aggr_level": 0, "is_leaf": 0}),
+        ("flow_code",     "tradeflow_mapping", "flow_code",
+            "flow_desc", {}),
+        ("freq_code",     "frequency_mapping", "freq_code",
+            "freq_desc", {}),
+        ("mot_code",      "transport_mapping", "mot_code",
+            "mot_desc", {}),
+        ("qty_unit_code", "unit_quantity_mapping", "qty_code",
+            "qty_description", {"qty_abbr": "UNK"}),
+        ("alt_qty_unit_code", "unit_quantity_mapping", "qty_code",
+            "qty_description", {"qty_abbr": "UNK"}),
+    ]
+
+    with engine.begin() as conn:
+        for fact_col, parent_tbl, parent_pk, text_col, extras in fk_specs:
+            wanted = codes(fact_col)
+            if not wanted:
+                continue
+            existing = {
+                row[0] for row in conn.execute(
+                    text(
+                        f"SELECT {parent_pk} FROM {parent_tbl} "
+                        f"WHERE {parent_pk} IN :codes"
+                    ).bindparams(
+                        __import__("sqlalchemy").bindparam(
+                            "codes", expanding=True
+                        )
+                    ),
+                    {"codes": list(wanted)},
+                )
+            }
+            missing = wanted - existing
+            if not missing:
+                continue
+            logger.info(
+                "Inserting %d placeholder rows into %s for unknown "
+                "%s codes: %s",
+                len(missing), parent_tbl, fact_col,
+                ", ".join(sorted(missing)[:10])
+                + ("..." if len(missing) > 10 else ""),
+            )
+            cols = [parent_pk, text_col] + list(extras.keys())
+            placeholders = ", ".join(f":{c}" for c in cols)
+            insert_sql = text(
+                f"INSERT IGNORE INTO {parent_tbl} ({', '.join(cols)}) "
+                f"VALUES ({placeholders})"
+            )
+            rows = [
+                {parent_pk: code,
+                 text_col: f"UNKNOWN ({code})",
+                 **extras}
+                for code in sorted(missing)
+            ]
+            conn.execute(insert_sql, rows)
+
+
+def remove_chunk_rows_from_mysql(engine, chunk_id: str) -> int:
+    """Delete all fact rows tagged with a given chunk_id.
+
+    Mirrors remove_chunk_rows_from_master().  Called when restarting
+    a chunk whose previous attempt crashed -- prevents unique-key
+    collisions when the same logical rows are re-fetched and inserted.
+    """
+    if engine is None or not chunk_id:
+        return 0
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(f"DELETE FROM {FACT_TABLE} WHERE chunk_id = :cid"),
+            {"cid": chunk_id},
+        )
+        return result.rowcount or 0
+
+def delete_trade_scope(engine, df: pd.DataFrame) -> None:
+    if df.empty:
+        return
+
+    period = str(df["period"].iloc[0])
+    reporter_code = str(df["reporter_code"].iloc[0])
+    flow_code = str(df["flow_code"].iloc[0])
+
+    sql = f"""
+    DELETE FROM {FACT_TABLE}
+    WHERE period = :period
+      AND reporter_code = :reporter_code
+      AND flow_code = :flow_code
+    """
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(sql),
+            {
+                "period": period,
+                "reporter_code": reporter_code,
+                "flow_code": flow_code,
+            },
+        )
+
+
+def mysql_insert_ignore_duplicates(table, conn, keys, data_iter):
+    """
+    Custom pandas.to_sql insert method for MySQL.
+
+    Uses INSERT IGNORE so rows that violate a UNIQUE KEY / PRIMARY KEY
+    are skipped instead of crashing the loader.
+
+    This is useful for resumable jobs where a chunk may have partially
+    loaded in a previous run.
+    """
+    rows = [dict(zip(keys, row)) for row in data_iter]
+
+    if not rows:
+        return 0
+
+    stmt = mysql_insert(table.table).values(rows).prefix_with("IGNORE")
+    result = conn.execute(stmt)
+
+    # With INSERT IGNORE, rowcount is the number of rows actually inserted.
+    # Duplicate rows are ignored and not counted as inserted.
+    return result.rowcount or 0
 
 
 def write_to_mysql(engine, df: pd.DataFrame) -> None:
-    if engine is None or df.empty:
+    """
+    Write a cleaned Comtrade dataframe to MySQL safely.
+
+    Behavior:
+      - Fills FK default/sentinel values.
+      - Ensures parent/reference rows exist before fact insert.
+      - Inserts new rows into FACT_TABLE.
+      - Skips duplicate rows using INSERT IGNORE.
+      - Does NOT delete existing rows.
+      - Does NOT crash on duplicate unique-key conflicts.
+    """
+    if engine is None:
+        logger.warning("write_to_mysql skipped because engine is None.")
         return
-    df.to_sql(
-        "fact_trade_granular",
-        con=engine,
-        if_exists="append",
-        index=False,
-        chunksize=5000,
-        method="multi",
-    )
+
+    if df is None or df.empty:
+        logger.info("write_to_mysql skipped because dataframe is empty.")
+        return
+
+    df = df.copy()
+
+    # ------------------------------------------------------------
+    # 1. Normalize missing values for FK/default columns
+    # ------------------------------------------------------------
+    for col, default in FK_DEFAULTS.items():
+        if col in df.columns:
+            df[col] = (
+                df[col]
+                .fillna(default)
+                .replace("", default)
+                .astype(str)
+            )
+
+    # ------------------------------------------------------------
+    # 2. Normalize natural-key columns as strings
+    # ------------------------------------------------------------
+    natural_key_cols = [
+        "period",
+        "reporter_code",
+        "flow_code",
+        "partner_code",
+        "partner2_code",
+        "cmd_code",
+        "customs_code",
+        "mot_code",
+    ]
+
+    for col in natural_key_cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str).where(df[col].notna(), None)
+
+    # ------------------------------------------------------------
+    # 3. Ensure parent/reference rows exist before inserting facts
+    # ------------------------------------------------------------
+    try:
+        _ensure_parent_rows(engine, df)
+    except Exception:
+        logger.exception(
+            "Failed while ensuring parent/reference rows before insert. "
+            "table=%s rows=%d sample=%s",
+            FACT_TABLE,
+            len(df),
+            df.head(1).to_dict(orient="records"),
+        )
+        raise
+
+    # ------------------------------------------------------------
+    # 4. Insert rows, ignoring duplicate unique-key conflicts
+    # ------------------------------------------------------------
+    try:
+        with engine.begin() as conn:
+            inserted_count = df.to_sql(
+                FACT_TABLE,
+                con=conn,
+                if_exists="append",
+                index=False,
+                chunksize=100,
+                method=mysql_insert_ignore_duplicates,
+            )
+
+        inserted_count = 0 if inserted_count is None else int(inserted_count)
+        skipped_count = max(len(df) - inserted_count, 0)
+
+        logger.info(
+            "MySQL insert complete for table=%s input_rows=%d inserted=%d "
+            "skipped_duplicates_or_ignored=%d",
+            FACT_TABLE,
+            len(df),
+            inserted_count,
+            skipped_count,
+        )
+
+    except Exception:
+        logger.exception(
+            "to_sql failed for table=%s rows=%d first-row sample: %s",
+            FACT_TABLE,
+            len(df),
+            df.head(1).to_dict(orient="records"),
+        )
+        raise
 
 
 # ----------------------------------------------------------------------
@@ -935,11 +1214,17 @@ def main() -> None:
     engine = get_engine()
 
     jobs = plan_jobs()
+    sinks = []
+    if WRITE_MASTER_CSV:
+        sinks.append("CSV")
+    if LOAD_TO_MYSQL:
+        sinks.append("MySQL")
     logger.info(
         "Planned %d chunks  |  cl=%s  freq=%s  cmd=%s  flows=%s  "
-        "partner=%s  budget_left_today=%d/%d",
+        "partner=%s  sinks=%s  budget_left_today=%d/%d",
         len(jobs), CL_CODE, FREQ_CODE, CMD_CODE, FLOW_CODES,
         PARTNER_CODE if PARTNER_CODE else "ALL",
+        "+".join(sinks),
         remaining_budget(budget), MAX_DAILY_CALLS,
     )
 
@@ -964,8 +1249,14 @@ def main() -> None:
             if stale_chunk_id:
                 removed = remove_chunk_rows_from_master(stale_chunk_id)
                 if removed:
-                    logger.info("Removed %d stale rows from master for "
+                    logger.info("Removed %d stale rows from master CSV for "
                                 "chunk_id=%s", removed, stale_chunk_id)
+                removed_db = remove_chunk_rows_from_mysql(
+                    engine, stale_chunk_id
+                )
+                if removed_db:
+                    logger.info("Removed %d stale rows from MySQL for "
+                                "chunk_id=%s", removed_db, stale_chunk_id)
 
         if remaining_budget(budget) <= 0:
             logger.warning("Daily budget reached -- stopping.  "
