@@ -23,7 +23,7 @@
 --   _ensure_parent_rows() (mirrored from the comtrade loader) will
 --   insert placeholders.
 -- =====================================================================
-
+USE comtrade;
 SET NAMES utf8mb4;
 SET FOREIGN_KEY_CHECKS = 0;
 
@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS news_articles (
     url            VARCHAR(1000) NOT NULL,
     source_domain  VARCHAR(120) NULL,
     article_date   DATE NULL,
-    year_month     CHAR(7) NULL COMMENT 'YYYY-MM, join key',
+    year_month_date     CHAR(7) NULL COMMENT 'YYYY-MM, join key',
     period         VARCHAR(8) NULL COMMENT 'YYYYMM, fact-table join key',
     language       VARCHAR(8) NULL,
 
@@ -118,7 +118,7 @@ CREATE TABLE IF NOT EXISTS news_events (
     matched_term     VARCHAR(120) NULL,
 
     event_date       DATE NULL,
-    year_month       CHAR(7) NULL,
+    year_month_date       CHAR(7) NULL,
     period           VARCHAR(8) NULL,
 
     actor1_name      VARCHAR(120) NULL,
@@ -169,7 +169,7 @@ CREATE TABLE IF NOT EXISTS news_events (
 -- =====================================================================
 CREATE TABLE IF NOT EXISTS news_linking (
     cmd_code        VARCHAR(10) NOT NULL,
-    year_month      CHAR(7)     NOT NULL,
+    year_month_date      CHAR(7)     NOT NULL,
     period          VARCHAR(8)  NOT NULL
                     COMMENT 'YYYYMM, matches fact_trade_granular.period',
 
@@ -193,7 +193,7 @@ CREATE TABLE IF NOT EXISTS news_linking (
 
     updated_at      DATETIME NOT NULL,
 
-    PRIMARY KEY (cmd_code, year_month),
+    PRIMARY KEY (cmd_code, year_month_date),
     KEY idx_link_period (cmd_code, period),
 
     CONSTRAINT fk_link_cmd
