@@ -14,9 +14,3 @@ Reference materials and design artifacts. None of these are read by the ETL pipe
 
 - **`ComtradePlus_DataItems.xlsx`** — refresh if UN Comtrade adds/renames API fields. Last verified against the current Comtrade Plus reference. If you update this and find new fields worth keeping, add them to `COLUMN_RENAME` in `etl/comtrade/comtrade_granular_loader.py` and to the `fact_trade_granular` schema.
 - **EER files** — re-export the PNG from Workbench whenever `schema/01_comtrade_schema.sql` or `schema/02_news_schema.sql` changes meaningfully. The two SQL files are the source of truth; the diagram is the visual.
-
-## Suggested additions (not yet here)
-
-- A short architecture write-up (markdown) describing the two Comtrade pipelines and why both exist.
-- The project proposal / final report once it's submitted.
-- Slide deck PDFs.
