@@ -50,8 +50,9 @@ import re
 import time
 import uuid
 import zipfile
+import random
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Optional
@@ -88,9 +89,39 @@ TERM_LANGUAGE     = os.getenv("TERM_LANGUAGE", "en")
 # GDELT DOC API behaviour
 GDELT_DOC_URL     = "https://api.gdeltproject.org/api/v2/doc/doc"
 MAX_RECORDS       = int(os.getenv("MAX_RECORDS", "250"))     # GDELT cap
-SLEEP_SECONDS     = float(os.getenv("SLEEP_SECONDS", "0.5"))
-RETRY_ATTEMPTS    = int(os.getenv("RETRY_ATTEMPTS", "3"))
-RETRY_BACKOFF_S   = float(os.getenv("RETRY_BACKOFF_S", "3.0"))
+
+# Conservative defaults because GDELT commonly throttles/heavily delays DOC calls.
+# Override in .env if needed:
+#   SLEEP_SECONDS=8
+#   GDELT_TIMEOUT_SECONDS=60
+#   RETRY_ATTEMPTS=3
+#   RETRY_BACKOFFS=10,30,90
+#   RATE_LIMIT_BACKOFFS=30,90,180
+# Keep old SLEEP_SECONDS env compatibility, but protect against accidentally
+# hammering GDELT with values like 0.5 from earlier runs.
+RAW_SLEEP_SECONDS    = float(os.getenv("SLEEP_SECONDS", "8.0"))
+MIN_SLEEP_SECONDS    = float(os.getenv("MIN_SLEEP_SECONDS", "8.0"))
+SLEEP_SECONDS        = max(RAW_SLEEP_SECONDS, MIN_SLEEP_SECONDS)
+GDELT_TIMEOUT_SECONDS = float(os.getenv("GDELT_TIMEOUT_SECONDS", "60"))
+RAW_RETRY_ATTEMPTS   = int(os.getenv("RETRY_ATTEMPTS", "4"))
+MIN_RETRY_ATTEMPTS   = int(os.getenv("MIN_RETRY_ATTEMPTS", "4"))
+RETRY_ATTEMPTS       = max(RAW_RETRY_ATTEMPTS, MIN_RETRY_ATTEMPTS)
+
+
+def _parse_backoff_env(name: str, default: str) -> list[float]:
+    raw = os.getenv(name, default)
+    vals: list[float] = []
+    for piece in raw.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        vals.append(float(piece))
+    return vals or [float(x) for x in default.split(",")]
+
+
+RETRY_BACKOFFS      = _parse_backoff_env("RETRY_BACKOFFS", "10,30,90")
+RATE_LIMIT_BACKOFFS = _parse_backoff_env("RATE_LIMIT_BACKOFFS", "30,90,180,300")
+BACKOFF_JITTER_S    = float(os.getenv("BACKOFF_JITTER_S", "2.0"))
 
 # Budget — defends against runaway loops, not a hard GDELT cost
 MAX_DAILY_CALLS   = int(os.getenv("MAX_DAILY_CALLS", "2000"))
@@ -123,10 +154,48 @@ log = logging.getLogger("news_loader")
 # hits rather than every article that happens to mention the word.
 
 TRADE_CONTEXT_TERMS = [
-    "tariff", "tariffs", "exports", "imports", "shortage", "price",
-    "prices", "sanction", "sanctions", "ban", "banned", "embargo",
-    "trade", "demand", "supply", "production",
+    # Keep this list intentionally short.
+    # GDELT rejects or times out on very long OR clauses.
+    # These terms are high-signal for import/export/trade coverage.
+    "trade", "imports", "import", "exports", "export",
+    "tariff", "tariffs", "quota", "quotas",
+    "shipment", "shipments", "shipping", "freight",
+    "supply", "demand", "shortage",
+    "price", "prices",
+    "ban", "export ban", "import ban",
+    "sanctions", "embargo",
 ]
+
+# Optional broader list. Use only if you are running small batches and GDELT is stable.
+EXTENDED_TRADE_CONTEXT_TERMS = [
+    "trading", "global trade", "international trade",
+    "imported", "importer", "importers",
+    "exported", "exporter", "exporters",
+    "trade flows", "bilateral trade",
+    "cargo", "port", "ports", "customs", "supply chain",
+    "inventory", "inventories", "surplus",
+    "duties", "restriction", "restrictions",
+    "trade dispute", "foreign buyers", "overseas buyers",
+    "supplier", "suppliers", "tender", "tenders",
+]
+
+TRADE_CONTEXT_LEVEL = os.getenv("TRADE_CONTEXT_LEVEL", "core").strip().lower()
+
+# Ground commodity queries in trade context using a short core OR clause by default.
+# This keeps articles focused on imports/exports/trade instead of general news.
+# Set TRADE_CONTEXT_MODE=short_or_noisy in .env if you only want context for
+# short terms and terms marked noisy in commodity_search_terms.notes.
+TRADE_CONTEXT_MODE = os.getenv("TRADE_CONTEXT_MODE", "all").strip().lower()
+
+# Query strategy:
+#   combined         -> one API call per commodity term using: term AND (ctx1 OR ctx2 OR ...)
+#   separate_context -> many smaller API calls per commodity term using: term AND ctx1, term AND ctx2, ...
+#
+# separate_context is safer for GDELT query-length limits and gives more
+# variability, but it uses more API calls. Keep TRADE_CONTEXT_QUERY_LIMIT modest.
+TRADE_QUERY_STRATEGY = os.getenv("TRADE_QUERY_STRATEGY", "separate_context").strip().lower()
+TRADE_CONTEXT_QUERY_LIMIT = int(os.getenv("TRADE_CONTEXT_QUERY_LIMIT", "10"))
+
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -138,16 +207,137 @@ SESSION.headers.update({
 })
 
 
-def build_doc_query(term: str, is_noisy: bool) -> str:
-    if is_noisy:
-        ctx = " OR ".join(f'"{c}"' for c in TRADE_CONTEXT_TERMS)
-        return f'"{term}" AND ({ctx})'
-    return f'"{term}"'
+def _gdelt_term_expr(raw: str) -> str:
+    """Format one GDELT query term safely.
 
+    GDELT rejects very short quoted phrases like "beef" with:
+        The specified phrase is too short.
+
+    So single words stay unquoted. Multi-word phrases are quoted.
+    """
+    clean = (raw or "").strip()
+    if not clean:
+        return ""
+    return f'"{clean}"' if " " in clean else clean
+
+
+def _trade_context_clause() -> str:
+    """Return the OR clause used to ground commodity searches in trade.
+
+    Keep this short by default. GDELT can return 429s, timeouts, or
+    "Your query was too short or too long" when the OR clause gets large.
+
+    .env options:
+        TRADE_CONTEXT_LEVEL=core      # default, safest
+        TRADE_CONTEXT_LEVEL=extended  # broader, slower/more likely to throttle
+    """
+    context_terms = list(TRADE_CONTEXT_TERMS)
+    if TRADE_CONTEXT_LEVEL in {"extended", "full", "broad"}:
+        context_terms += EXTENDED_TRADE_CONTEXT_TERMS
+
+    pieces = [_gdelt_term_expr(t) for t in context_terms if (t or "").strip()]
+    # De-dupe while preserving order.
+    pieces = list(dict.fromkeys(pieces))
+    return " OR ".join(pieces)
+
+
+def _context_terms_for_queries() -> list[str]:
+    """Return ordered trade context terms used for GDELT query construction.
+
+    In separate_context mode, each item becomes its own API query:
+        cattle AND trade
+        cattle AND imports
+        cattle AND exports
+
+    Keeping this list short is important because API calls = terms × contexts.
+    Use TRADE_CONTEXT_QUERY_LIMIT in .env to cap it.
+    """
+    context_terms = list(TRADE_CONTEXT_TERMS)
+    if TRADE_CONTEXT_LEVEL in {"extended", "full", "broad"}:
+        context_terms += EXTENDED_TRADE_CONTEXT_TERMS
+
+    # De-dupe while preserving order and drop empties.
+    context_terms = [t.strip() for t in context_terms if (t or "").strip()]
+    context_terms = list(dict.fromkeys(context_terms))
+
+    if TRADE_CONTEXT_QUERY_LIMIT and TRADE_CONTEXT_QUERY_LIMIT > 0:
+        context_terms = context_terms[:TRADE_CONTEXT_QUERY_LIMIT]
+
+    return context_terms
+
+
+def _needs_trade_context(term: str, is_noisy: bool) -> bool:
+    clean = (term or "").strip()
+    words = clean.split()
+    is_single_short_word = len(words) == 1 and len(clean) <= 5
+
+    if TRADE_CONTEXT_MODE in {"none", "off", "false", "0"}:
+        return False
+    if TRADE_CONTEXT_MODE in {"noisy"}:
+        return is_noisy
+    if TRADE_CONTEXT_MODE in {"short_or_noisy", "short", "short-noisy"}:
+        return is_noisy or is_single_short_word
+    return True
+
+
+def build_doc_queries(term: str, is_noisy: bool) -> list[tuple[str, str]]:
+    """Build one or more GDELT DOC queries for a commodity term.
+
+    Returns a list of (query_label, query_string).
+
+    Recommended/default mode is separate_context:
+        cattle AND trade
+        cattle AND imports
+        cattle AND exports
+
+    This avoids giant OR clauses that GDELT rejects with messages like
+    'Your query was too short or too long' while still grounding articles
+    in imports/exports/trade.
+    """
+    clean = (term or "").strip()
+    if not clean:
+        return []
+
+    term_expr = _gdelt_term_expr(clean)
+
+    if not _needs_trade_context(clean, is_noisy):
+        return [("raw", term_expr)]
+
+    context_terms = _context_terms_for_queries()
+
+    if TRADE_QUERY_STRATEGY in {"separate", "separate_context", "split", "split_context"}:
+        queries: list[tuple[str, str]] = []
+        for ctx in context_terms:
+            ctx_expr = _gdelt_term_expr(ctx)
+            queries.append((ctx, f"{term_expr} AND {ctx_expr}"))
+        return queries or [("raw", term_expr)]
+
+    # Fallback/legacy: one combined OR query.
+    ctx = " OR ".join(_gdelt_term_expr(t) for t in context_terms)
+    return [("combined_context", f"{term_expr} AND ({ctx})")]
+
+
+def build_doc_query(term: str, is_noisy: bool) -> str:
+    """Backward-compatible single-query helper."""
+    queries = build_doc_queries(term, is_noisy)
+    return queries[0][1] if queries else ""
 
 def fmt_gdelt_datetime(d: date, end_of_day: bool = False) -> str:
     suffix = "235959" if end_of_day else "000000"
     return d.strftime("%Y%m%d") + suffix
+
+
+def _backoff_seconds(schedule: list[float], attempt: int) -> float:
+    """Return the sleep for a 1-indexed attempt, with small jitter."""
+    base = schedule[min(attempt - 1, len(schedule) - 1)]
+    jitter = random.uniform(0, BACKOFF_JITTER_S) if BACKOFF_JITTER_S > 0 else 0.0
+    return base + jitter
+
+
+def _preview_response_text(resp: requests.Response, limit: int = 300) -> str:
+    """Small safe preview for diagnosing non-JSON/HTML GDELT responses."""
+    body = (resp.text or "").replace("\n", " ").replace("\r", " ").strip()
+    return body[:limit]
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -391,13 +581,20 @@ class RawArticle:
     score:        float
 
 
-def fetch_articles_for_term(
+def fetch_articles_for_query(
     term: SearchTerm,
+    query: str,
+    query_label: str,
     start: date,
     end: date,
 ) -> list[dict]:
+    """Fetch one concrete GDELT DOC query.
+
+    In separate_context mode this is called once per context term, e.g.
+    query_label='imports', query='cattle AND imports'.
+    """
     params = {
-        "query":         build_doc_query(term.term, term.is_noisy),
+        "query":         query,
         "mode":          "artlist",
         "maxrecords":    MAX_RECORDS,
         "startdatetime": fmt_gdelt_datetime(start, end_of_day=False),
@@ -407,33 +604,125 @@ def fetch_articles_for_term(
     }
 
     last_exc: Optional[BaseException] = None
+
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            r = SESSION.get(GDELT_DOC_URL, params=params, timeout=30)
+            r = SESSION.get(GDELT_DOC_URL, params=params, timeout=GDELT_TIMEOUT_SECONDS)
+
             if r.status_code == 429:
-                wait = RETRY_BACKOFF_S * attempt
-                log.warning("429 from GDELT, sleeping %.1fs", wait)
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            # GDELT occasionally returns HTML when the server is under
-            # load — guard against it.
+                last_exc = RuntimeError(
+                    f"GDELT rate limited status=429 response={_preview_response_text(r, 200)!r}"
+                )
+                if attempt < RETRY_ATTEMPTS:
+                    wait = _backoff_seconds(RATE_LIMIT_BACKOFFS, attempt)
+                    log.warning(
+                        "429 from GDELT for term=%r context=%r attempt %d/%d; sleeping %.1fs; response=%r",
+                        term.term, query_label, attempt, RETRY_ATTEMPTS, wait, _preview_response_text(r, 200),
+                    )
+                    time.sleep(wait)
+                    continue
+                raise last_exc
+
+            if 500 <= r.status_code <= 599:
+                last_exc = RuntimeError(f"GDELT server status={r.status_code}")
+                if attempt < RETRY_ATTEMPTS:
+                    wait = _backoff_seconds(RETRY_BACKOFFS, attempt)
+                    log.warning(
+                        "GDELT server error status=%s for term=%r context=%r attempt %d/%d; sleeping %.1fs; response=%r",
+                        r.status_code, term.term, query_label, attempt, RETRY_ATTEMPTS, wait, _preview_response_text(r, 200),
+                    )
+                    time.sleep(wait)
+                    continue
+                raise last_exc
+
+            if r.status_code >= 400:
+                log.warning(
+                    "GDELT HTTP error status=%s for term=%r context=%r; response=%r",
+                    r.status_code, term.term, query_label, _preview_response_text(r, 300),
+                )
+                r.raise_for_status()
+
             try:
                 payload = r.json()
-            except ValueError:
-                raise RuntimeError(f"non-JSON response (len={len(r.text)})")
-            return payload.get("articles", []) or []
+            except ValueError as exc:
+                last_exc = RuntimeError(
+                    f"non-JSON response status={r.status_code} "
+                    f"content_type={r.headers.get('Content-Type')} "
+                    f"len={len(r.text)} preview={_preview_response_text(r, 300)!r}"
+                )
+                if attempt < RETRY_ATTEMPTS:
+                    wait = _backoff_seconds(RETRY_BACKOFFS, attempt)
+                    log.warning(
+                        "GDELT DOC attempt %d/%d non-JSON for term=%r context=%r — sleep %.1fs — %s",
+                        attempt, RETRY_ATTEMPTS, term.term, query_label, wait, last_exc,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise last_exc from exc
+
+            articles = payload.get("articles", []) or []
+            log.info(
+                "GDELT returned %d articles for term=%r context=%r query=%r",
+                len(articles), term.term, query_label, query,
+            )
+            return articles
+
+        except requests.exceptions.ReadTimeout as exc:
+            last_exc = exc
+            if attempt < RETRY_ATTEMPTS:
+                wait = _backoff_seconds(RETRY_BACKOFFS, attempt)
+                log.warning(
+                    "GDELT DOC timeout attempt %d/%d for term=%r context=%r after %.0fs — sleep %.1fs",
+                    attempt, RETRY_ATTEMPTS, term.term, query_label, GDELT_TIMEOUT_SECONDS, wait,
+                )
+                time.sleep(wait)
+                continue
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            if attempt < RETRY_ATTEMPTS:
+                wait = _backoff_seconds(RETRY_BACKOFFS, attempt)
+                log.warning(
+                    "GDELT DOC request attempt %d/%d failed for term=%r context=%r (%r) — sleep %.1fs",
+                    attempt, RETRY_ATTEMPTS, term.term, query_label, exc, wait,
+                )
+                time.sleep(wait)
+                continue
         except Exception as exc:
             last_exc = exc
             if attempt < RETRY_ATTEMPTS:
-                wait = RETRY_BACKOFF_S * attempt
-                log.warning("GDELT DOC attempt %d/%d failed (%r) — sleep %.1fs",
-                            attempt, RETRY_ATTEMPTS, exc, wait)
+                wait = _backoff_seconds(RETRY_BACKOFFS, attempt)
+                log.warning(
+                    "GDELT DOC attempt %d/%d failed for term=%r context=%r (%r) — sleep %.1fs",
+                    attempt, RETRY_ATTEMPTS, term.term, query_label, exc, wait,
+                )
                 time.sleep(wait)
-    log.error("GDELT DOC failed after %d attempts for term=%r: %r",
-              RETRY_ATTEMPTS, term.term, last_exc)
-    return []
+                continue
 
+    log.error(
+        "GDELT DOC failed after %d attempts for term=%r context=%r: %r",
+        RETRY_ATTEMPTS, term.term, query_label, last_exc,
+    )
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"GDELT DOC failed for term={term.term!r}, context={query_label!r}")
+
+
+def fetch_articles_for_term(
+    term: SearchTerm,
+    start: date,
+    end: date,
+) -> list[dict]:
+    """Backward-compatible fetch helper.
+
+    Runs all concrete queries for the term and returns their concatenated article
+    list. collect_articles() uses the lower-level fetch_articles_for_query() so
+    it can write to DB after every separate context query.
+    """
+    all_articles: list[dict] = []
+    for query_label, query in build_doc_queries(term.term, term.is_noisy):
+        all_articles.extend(fetch_articles_for_query(term, query, query_label, start, end))
+        time.sleep(SLEEP_SECONDS)
+    return all_articles
 
 def _parse_gdelt_date(raw: str) -> Optional[date]:
     """GDELT seendate is 'YYYYMMDDTHHMMSSZ'."""
@@ -445,92 +734,204 @@ def _parse_gdelt_date(raw: str) -> Optional[date]:
         return None
 
 
+def _articles_to_raw_rows(term: SearchTerm, arts: list[dict], context_label: str = "") -> list[RawArticle]:
+    """Convert one GDELT response into RawArticle rows for one commodity term."""
+    term_raw: list[RawArticle] = []
+    for a in arts:
+        url = (a.get("url") or "").strip()
+        if not url:
+            continue
+        title = (a.get("title") or "").strip()
+        title_lc = title.lower()
+        term_lc  = term.term.lower()
+        title_bonus = 3.0 if term_lc in title_lc else 0.0
+
+        # Small score bump when the title also contains the context word.
+        context_bonus = 0.0
+        if context_label and context_label != "raw":
+            ctx_lc = context_label.lower().strip('"')
+            if ctx_lc in title_lc:
+                context_bonus = 0.5
+
+        term_raw.append(RawArticle(
+            url           = url,
+            url_hash      = md5(url),
+            title         = title,
+            source_domain = (a.get("domain") or "").strip(),
+            article_date  = _parse_gdelt_date(a.get("seendate", "")),
+            language      = (a.get("language") or "").strip(),
+            cmd_code      = term.cmd_code,
+            matched_term  = term.term,
+            score         = term.base_score + title_bonus + context_bonus,
+        ))
+    return term_raw
+
+
 def collect_articles(
     terms: list[SearchTerm],
     start: date,
     end: date,
     budget: dict,
     engine,
-) -> list[RawArticle]:
-    """Iterate every active term, accumulate raw (article, term) hits.
+    rerun_successful: bool = False,
+) -> dict[str, int]:
+    """Fetch, attribute, and write articles in bounded chunks.
 
-    Resumability: each (cmd_code, term, window) tuple has a manifest
-    row.  Successful runs are skipped.  Crashes mid-run resume from
-    the next un-tackled term.
+    In TRADE_QUERY_STRATEGY=separate_context mode, each commodity/context pair
+    is a separate GDELT API call and is written to MySQL immediately:
+        cattle AND trade      -> write rows
+        cattle AND imports    -> write rows
+        cattle AND exports    -> write rows
+
+    This avoids long OR queries and avoids keeping all results in memory.
+    Existing URL duplicates are protected by INSERT IGNORE.
     """
-    raw: list[RawArticle] = []
+    total_api_articles = 0
+    total_raw_hits = 0
+    total_unique_submitted = 0
+    total_api_calls = 0
+    total_query_failures = 0
+    terms_written = 0
 
     for i, term in enumerate(terms, 1):
         mkey = f"news|article|{term.cmd_code}|{term.term}|{start}|{end}"
 
-        if _manifest_status(engine, mkey) == "success":
+        status = _manifest_status(engine, mkey)
+        if status == "success" and not rerun_successful:
+            log.info("[%d/%d] SKIP already successful cmd=%s term=%r window=%s..%s",
+                     i, len(terms), term.cmd_code, term.term, start, end)
+            continue
+        if status == "success" and rerun_successful:
+            log.info("[%d/%d] RERUN previously successful cmd=%s term=%r window=%s..%s",
+                     i, len(terms), term.cmd_code, term.term, start, end)
+
+        queries = build_doc_queries(term.term, term.is_noisy)
+        if not queries:
+            log.warning("[%d/%d] No GDELT queries built for cmd=%s term=%r; skipping",
+                        i, len(terms), term.cmd_code, term.term)
             continue
 
         if remaining_budget(budget) <= 0:
-            log.warning("Daily call budget exhausted at term %d/%d — "
-                        "stopping article collection.", i, len(terms))
+            log.warning("Daily call budget exhausted at term %d/%d — stopping article collection.", i, len(terms))
             break
 
-        log.info("[%d/%d] cmd=%s term=%r (pri=%d, %s%s)",
-                 i, len(terms), term.cmd_code, term.term,
-                 term.priority, term.source,
-                 ", noisy→context" if term.is_noisy else "")
+        log.info(
+            "[%d/%d] cmd=%s term=%r (pri=%d, %s%s) concrete_queries=%d strategy=%s",
+            i, len(terms), term.cmd_code, term.term, term.priority, term.source,
+            ", noisy→context" if term.is_noisy else "",
+            len(queries), TRADE_QUERY_STRATEGY,
+        )
 
         _manifest_upsert(engine, mkey, {
             "cmd_code": term.cmd_code, "search_term": term.term,
             "window_start": start, "window_end": end,
             "stype": "article", "status": "in_progress",
+            "error": None,
         })
 
-        try:
-            charge_budget(budget, 1)
-            arts = fetch_articles_for_term(term, start, end)
-        except Exception as exc:
-            log.exception("Term %r crashed: %r", term.term, exc)
-            _manifest_upsert(engine, mkey,
-                             {"status": "failed", "error": repr(exc)[:480]})
-            time.sleep(SLEEP_SECONDS)
-            continue
+        term_api_articles = 0
+        term_raw_hits = 0
+        term_unique_submitted = 0
+        term_api_calls = 0
+        term_failures = 0
+        term_successful_queries = 0
 
-        for a in arts:
-            url = (a.get("url") or "").strip()
-            if not url:
+        for qnum, (query_label, query) in enumerate(queries, 1):
+            if remaining_budget(budget) <= 0:
+                log.warning("Daily call budget exhausted inside term=%r after %d/%d queries.",
+                            term.term, qnum - 1, len(queries))
+                break
+
+            log.info(
+                "[%d/%d q%d/%d] querying cmd=%s term=%r context=%r query=%r",
+                i, len(terms), qnum, len(queries), term.cmd_code, term.term, query_label, query,
+            )
+
+            try:
+                charge_budget(budget, 1)
+                term_api_calls += 1
+                total_api_calls += 1
+                arts = fetch_articles_for_query(term, query, query_label, start, end)
+            except Exception as exc:
+                term_failures += 1
+                total_query_failures += 1
+                log.exception(
+                    "Query failed before DB write for term=%r context=%r query=%r: %r",
+                    term.term, query_label, query, exc,
+                )
+                # Continue to the next smaller context query instead of losing the whole term.
+                time.sleep(SLEEP_SECONDS)
                 continue
-            title = (a.get("title") or "").strip()
-            # Term must literally appear in the title for it to count
-            # as a match here — GDELT DOC API's relevance ranking is
-            # title-heavy but not strict, so we filter to be safe.
-            title_lc = title.lower()
-            term_lc  = term.term.lower()
-            if term_lc not in title_lc:
-                # Still attribute, but with a body-only penalty
-                title_bonus = 0.0
-            else:
-                title_bonus = 3.0
 
-            raw.append(RawArticle(
-                url           = url,
-                url_hash      = md5(url),
-                title         = title,
-                source_domain = (a.get("domain") or "").strip(),
-                article_date  = _parse_gdelt_date(a.get("seendate", "")),
-                language      = (a.get("language") or "").strip(),
-                cmd_code      = term.cmd_code,
-                matched_term  = term.term,
-                score         = term.base_score + title_bonus,
-            ))
+            term_successful_queries += 1
+            term_api_articles += len(arts)
+            total_api_articles += len(arts)
 
-        _manifest_upsert(engine, mkey, {
-            "status": "success",
-            "rows_collected": len(arts),
-            "n_api_calls": 1,
-        })
+            term_raw = _articles_to_raw_rows(term, arts, context_label=query_label)
+            article_rows = attribute_articles(term_raw)
 
-        time.sleep(SLEEP_SECONDS)
+            try:
+                write_articles(engine, article_rows)
+            except Exception as exc:
+                term_failures += 1
+                total_query_failures += 1
+                log.exception(
+                    "DB write failed for term=%r context=%r; continuing to next query: %r",
+                    term.term, query_label, exc,
+                )
+                time.sleep(SLEEP_SECONDS)
+                continue
 
-    log.info("Article collection: %d raw (article, term) hits across "
-             "%d unique URLs", len(raw), len({a.url_hash for a in raw}))
-    return raw
+            term_raw_hits += len(term_raw)
+            term_unique_submitted += len(article_rows)
+            total_raw_hits += len(term_raw)
+            total_unique_submitted += len(article_rows)
+
+            log.info(
+                "[%d/%d q%d/%d] WROTE cmd=%s term=%r context=%r api_articles=%d valid_urls=%d unique_submitted=%d",
+                i, len(terms), qnum, len(queries), term.cmd_code, term.term, query_label,
+                len(arts), len(term_raw), len(article_rows),
+            )
+
+            time.sleep(SLEEP_SECONDS)
+
+        if term_successful_queries > 0:
+            terms_written += 1
+            _manifest_upsert(engine, mkey, {
+                "status": "success",
+                "rows_collected": term_api_articles,
+                "n_api_calls": term_api_calls,
+                "error": None if term_failures == 0 else f"Completed with {term_failures} query failures; see loader.log",
+            })
+            log.info(
+                "[%d/%d] TERM COMPLETE cmd=%s term=%r successful_queries=%d/%d api_articles=%d valid_urls=%d unique_submitted=%d failures=%d",
+                i, len(terms), term.cmd_code, term.term, term_successful_queries, len(queries),
+                term_api_articles, term_raw_hits, term_unique_submitted, term_failures,
+            )
+        else:
+            _manifest_upsert(engine, mkey, {
+                "status": "failed",
+                "rows_collected": 0,
+                "n_api_calls": term_api_calls,
+                "error": f"All {len(queries)} concrete queries failed; see loader.log",
+            })
+            log.error(
+                "[%d/%d] TERM FAILED cmd=%s term=%r all_queries_failed=%d",
+                i, len(terms), term.cmd_code, term.term, len(queries),
+            )
+
+    log.info(
+        "Article collection/write summary: terms_written=%d api_calls=%d api_articles=%d raw_valid_urls=%d unique_rows_submitted=%d query_failures=%d",
+        terms_written, total_api_calls, total_api_articles, total_raw_hits, total_unique_submitted, total_query_failures,
+    )
+    return {
+        "terms_written": terms_written,
+        "api_calls": total_api_calls,
+        "api_articles": total_api_articles,
+        "raw_valid_urls": total_raw_hits,
+        "unique_rows_submitted": total_unique_submitted,
+        "query_failures": total_query_failures,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -758,7 +1159,7 @@ def attribute_articles(raw: list[RawArticle]) -> list[dict]:
             "url":           winner.url[:1000],
             "source_domain": winner.source_domain[:120],
             "article_date":  d,
-            "year_month":    year_month,
+            "year_month_date":    year_month,
             "period":        period,
             "language":      winner.language[:8],
             "sentiment":     simple_sentiment(text_for_signals),
@@ -789,7 +1190,7 @@ def attribute_events(raw: list[RawEvent]) -> list[dict]:
             "cmd_code":        w.cmd_code,
             "matched_term":    w.matched_term,
             "event_date":      d,
-            "year_month":      d.strftime("%Y-%m") if d else None,
+            "year_month_date":      d.strftime("%Y-%m") if d else None,
             "period":          d.strftime("%Y%m")  if d else None,
             "actor1_name":     (w.actor1_name or "")[:120],
             "actor1_country":  (w.actor1_country or "")[:8],
@@ -869,7 +1270,7 @@ def write_events(engine, rows: list[dict]) -> None:
 
 REBUILD_LINKING_SQL = """
 INSERT INTO news_linking (
-    cmd_code, year_month, period,
+    cmd_code, year_month_date, period,
     article_count, event_count,
     avg_sentiment, avg_tone, avg_goldstein,
     signal_tariff, signal_sanction, signal_embargo,
@@ -879,7 +1280,7 @@ INSERT INTO news_linking (
 )
 SELECT
     base.cmd_code,
-    base.year_month,
+    base.year_month_date,
     base.period,
     COALESCE(a.cnt, 0)      AS article_count,
     COALESCE(e.cnt, 0)      AS event_count,
@@ -899,14 +1300,14 @@ SELECT
     COALESCE(a.s_export_ban,  0),
     UTC_TIMESTAMP()
 FROM (
-    SELECT cmd_code, year_month, period FROM news_articles
-        WHERE year_month IS NOT NULL
+    SELECT cmd_code, year_month_date, period FROM news_articles
+        WHERE year_month_date IS NOT NULL
     UNION
-    SELECT cmd_code, year_month, period FROM news_events
-        WHERE year_month IS NOT NULL
+    SELECT cmd_code, year_month_date, period FROM news_events
+        WHERE year_month_date IS NOT NULL
 ) base
 LEFT JOIN (
-    SELECT cmd_code, year_month,
+    SELECT cmd_code, year_month_date,
            COUNT(*) AS cnt,
            AVG(sentiment) AS avg_sentiment,
            SUM(trade_signals LIKE '%tariff%')      AS s_tariff,
@@ -921,18 +1322,18 @@ LEFT JOIN (
            SUM(trade_signals LIKE '%strike%')      AS s_strike,
            SUM(trade_signals LIKE '%export_ban%')  AS s_export_ban
     FROM news_articles
-    WHERE year_month IS NOT NULL
-    GROUP BY cmd_code, year_month
-) a ON a.cmd_code = base.cmd_code AND a.year_month = base.year_month
+    WHERE year_month_date IS NOT NULL
+    GROUP BY cmd_code, year_month_date
+) a ON a.cmd_code = base.cmd_code AND a.year_month_date = base.year_month_date
 LEFT JOIN (
-    SELECT cmd_code, year_month,
+    SELECT cmd_code, year_month_date,
            COUNT(*) AS cnt,
            AVG(avg_tone)        AS avg_tone,
            AVG(goldstein_scale) AS avg_goldstein
     FROM news_events
-    WHERE year_month IS NOT NULL
-    GROUP BY cmd_code, year_month
-) e ON e.cmd_code = base.cmd_code AND e.year_month = base.year_month
+    WHERE year_month_date IS NOT NULL
+    GROUP BY cmd_code, year_month_date
+) e ON e.cmd_code = base.cmd_code AND e.year_month_date = base.year_month_date  
 ;
 """
 
@@ -979,6 +1380,52 @@ def _manifest_upsert(engine, key: str, fields: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# RUN FILTER HELPERS
+# ─────────────────────────────────────────────────────────────────────
+
+def _split_csv_arg(raw: Optional[str]) -> list[str]:
+    if not raw:
+        return []
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def filter_terms_for_run(
+    terms: list[SearchTerm],
+    cmd_codes: Optional[str] = None,
+    max_terms: Optional[int] = None,
+) -> list[SearchTerm]:
+    """Optional run narrowing so you can safely batch GDELT calls."""
+    wanted_cmds = set(_split_csv_arg(cmd_codes))
+
+    if wanted_cmds:
+        before = len(terms)
+        terms = [t for t in terms if t.cmd_code in wanted_cmds]
+        log.info("Filtered terms by cmd_code=%s: %d → %d", sorted(wanted_cmds), before, len(terms))
+
+    if max_terms is not None and max_terms > 0:
+        before = len(terms)
+        terms = terms[:max_terms]
+        log.info("Limited terms with max_terms=%d: %d → %d", max_terms, before, len(terms))
+
+    return terms
+
+
+def reset_failed_manifest_rows(engine, start: date, end: date) -> int:
+    """Allow retrying failed/in_progress terms for the same window."""
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("""
+                DELETE FROM news_load_manifest
+                WHERE window_start = :start
+                  AND window_end = :end
+                  AND stype IN ('article', 'event')
+                  AND status IN ('failed', 'in_progress')
+            """),
+            {"start": start, "end": end},
+        )
+    return int(result.rowcount or 0)
+
+# ─────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────
 
@@ -992,6 +1439,14 @@ def parse_args() -> argparse.Namespace:
                    help="Skip collection; just rebuild news_linking")
     p.add_argument("--max-priority", type=int, default=None,
                    help="Override MAX_PRIORITY env (1=best, 9=worst)")
+    p.add_argument("--cmd-code", type=str, default=os.getenv("CMD_CODES"),
+                   help="Comma-separated HS cmd_codes to run, e.g. 01,02,10")
+    p.add_argument("--max-terms", type=int, default=int(os.getenv("MAX_TERMS", "0")) or None,
+                   help="Limit this run to the first N filtered terms")
+    p.add_argument("--reset-failed", action="store_true",
+                   help="Clear failed/in_progress manifest rows for this window before running")
+    p.add_argument("--rerun-articles", action="store_true",
+                   help="Re-query article terms even if their manifest status is already success. Useful after old runs that marked success before DB write.")
     return p.parse_args()
 
 
@@ -1011,36 +1466,62 @@ def main() -> None:
     engine = make_engine()
     ensure_news_manifest_table(engine)
 
+    if args.reset_failed:
+        deleted = reset_failed_manifest_rows(engine, start, end)
+        log.info("Reset %d failed/in_progress manifest rows for window=%s..%s", deleted, start, end)
+
     if args.rebuild_linking:
         rebuild_linking(engine)
         return
 
     terms = load_search_terms(engine, max_priority=max_priority)
+    terms = filter_terms_for_run(terms, cmd_codes=args.cmd_code, max_terms=args.max_terms)
     if not terms:
         raise SystemExit(
-            "No active terms in commodity_search_terms.  Did you load "
-            "the CSV with load_search_terms.py?"
+            "No active terms left after filtering. Check commodity_search_terms, "
+            "--max-priority, --cmd-code, --max-terms, and TERM_LANGUAGE."
         )
     ensure_chapter_rows(engine, {t.cmd_code for t in terms})
 
     if args.dry_run:
         log.info("DRY RUN — window=%s..%s  terms=%d  events=%s",
                  start, end, len(terms), do_events)
-        log.info("Estimated API calls: %d articles%s",
-                 len(terms),
+        log.info("GDELT pacing — sleep=%.1fs timeout=%.0fs retry_backoffs=%s rate_limit_backoffs=%s",
+                 SLEEP_SECONDS, GDELT_TIMEOUT_SECONDS, RETRY_BACKOFFS, RATE_LIMIT_BACKOFFS)
+        estimated_article_calls = sum(len(build_doc_queries(t.term, t.is_noisy)) for t in terms)
+        log.info("Estimated API calls: %d article queries from %d commodity terms%s",
+                 estimated_article_calls, len(terms),
                  f" + {min((end-start).days+1, MAX_EVENT_FILES)} event files"
                  if do_events else "")
+        log.info("Trade query strategy=%s context_level=%s context_query_limit=%d",
+                 TRADE_QUERY_STRATEGY, TRADE_CONTEXT_LEVEL, TRADE_CONTEXT_QUERY_LIMIT)
         return
 
     budget = load_budget()
     log.info("Run starting — window=%s..%s  terms=%d  budget_left=%d/%d",
              start, end, len(terms),
              remaining_budget(budget), MAX_DAILY_CALLS)
+    if RAW_SLEEP_SECONDS < MIN_SLEEP_SECONDS:
+        log.warning(
+            "SLEEP_SECONDS=%.1fs is below MIN_SLEEP_SECONDS=%.1fs; using %.1fs. "
+            "Update .env to SLEEP_SECONDS=8 or set MIN_SLEEP_SECONDS lower if intentional.",
+            RAW_SLEEP_SECONDS, MIN_SLEEP_SECONDS, SLEEP_SECONDS,
+        )
+    if RAW_RETRY_ATTEMPTS < MIN_RETRY_ATTEMPTS:
+        log.warning(
+            "RETRY_ATTEMPTS=%d is below MIN_RETRY_ATTEMPTS=%d; using %d.",
+            RAW_RETRY_ATTEMPTS, MIN_RETRY_ATTEMPTS, RETRY_ATTEMPTS,
+        )
+    log.info("GDELT pacing — sleep=%.1fs timeout=%.0fs retry_attempts=%d retry_backoffs=%s rate_limit_backoffs=%s",
+             SLEEP_SECONDS, GDELT_TIMEOUT_SECONDS, RETRY_ATTEMPTS, RETRY_BACKOFFS, RATE_LIMIT_BACKOFFS)
+    log.info("GDELT query strategy — trade_query_strategy=%s context_level=%s context_query_limit=%d",
+             TRADE_QUERY_STRATEGY, TRADE_CONTEXT_LEVEL, TRADE_CONTEXT_QUERY_LIMIT)
 
     # ARTICLES
-    raw_articles = collect_articles(terms, start, end, budget, engine)
-    articles     = attribute_articles(raw_articles)
-    write_articles(engine, articles)
+    article_summary = collect_articles(
+        terms, start, end, budget, engine, rerun_successful=args.rerun_articles
+    )
+    log.info("Article phase complete: %s", article_summary)
 
     # EVENTS
     if do_events:
