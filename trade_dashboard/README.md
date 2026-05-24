@@ -124,39 +124,3 @@ trade_dashboard/
 | **Composite risk** | `0.45·rank(HHI) + 0.35·rank(cmd HHI) + 0.20·rank(vol)` × 100 | Risk |
 
 Volatility uses the std of YoY growth across the full panel.
-
----
-
-## Rubric mapping
-
-| Rubric component | Where it lives |
-| --- | --- |
-| Business case & proposal | This README + the project proposal PDF |
-| EDA | `notebooks/` (add Jupyter notebook documenting profile / nulls / dist) |
-| OLTP→OLAP modeling | ER diagrams + grain doc in `docs/` (add for submission) |
-| ETL pipelines | Add ingestion scripts and a pipeline diagram in `etl/` |
-| Complex SQL | `sql/analytics_queries.sql` — 7 queries with CTEs, windows, joins |
-| BI surface | This Streamlit app — 5 pages answering ≥ 5 business questions |
-| Presentation | Slides + recording — see `docs/presentation/` |
-
----
-
-## Extending: news/event overlay
-
-When the news layer is ready, add `pages/5_Risk_Overlay.py`. The cleanest
-integration is a second derived metric on top of the trade-only composite:
-
-```
-final_risk_score = α · structural_risk + β · news_risk
-news_risk        = z-score of tone × event volume × source weight
-```
-
-Both signals are 0–1 normalized, so the composite is interpretable and the
-weights `(α, β)` become a single slider in the UI. Country-by-year is the
-natural join grain.
-
----
-
-## Contact
-
-Office hours or email Steve / Zach for course-related questions.
