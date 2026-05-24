@@ -1,0 +1,23 @@
+# Streamlit secrets — NEVER commit
+.streamlit/secrets.toml
+
+# Local env files
+.env
+.env.local
+
+# Cached / built data
+data/
+*.parquet
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
