@@ -127,7 +127,7 @@ html, body, [class*="css"] {
 # --- Header ---
 st.markdown("""
 <div class="title-block">
-    <h1>🛰️ BACKEND CHAT TEST</h1>
+    <h1>🛰️ Trade AI Analyst</h1>
     <p>FastAPI → OpenAI → GCP MySQL</p>
 </div>
 """, unsafe_allow_html=True)
