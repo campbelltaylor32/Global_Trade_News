@@ -3,7 +3,7 @@ import requests
 
 API_URL = "http://localhost:8000"
 
-st.set_page_config(page_title="Backend Chat Test", page_icon="🛰️", layout="wide")
+st.set_page_config(page_title="Trade AI Analyst", page_icon="🛰️", layout="wide")
 
 st.markdown("""
 <style>
