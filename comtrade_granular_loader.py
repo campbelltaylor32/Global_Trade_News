@@ -409,6 +409,137 @@ def upsert_manifest(manifest: pd.DataFrame, row: dict) -> pd.DataFrame:
     return manifest
 
 
+# Statuses that mean "do not spend another API call on this chunk".
+# Important: empty chunks still used one API call and should be skipped on rerun.
+TERMINAL_STATUSES = {"success", "empty", "truncated"}
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        if value is None or str(value).strip() == "":
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def get_manifest_row_for_job(manifest: pd.DataFrame, job: "ChunkJob") -> Optional[pd.Series]:
+    """Return prior manifest row for a planned job, if any."""
+    return manifest_lookup(manifest, job.manifest_key())
+
+
+def status_is_terminal(status: Optional[str]) -> bool:
+    return str(status or "").strip().lower() in TERMINAL_STATUSES
+
+
+def build_resume_stats(manifest: pd.DataFrame, jobs: list["ChunkJob"]) -> dict:
+    """
+    Build resume/progress stats from manifest for the currently planned jobs.
+
+    A reporter is considered "looked at" for a period if at least one of its
+    planned flow chunks has a terminal manifest status: success, empty, truncated.
+    A reporter is "fully complete" for a period if all of its planned flow chunks
+    for that period are terminal.
+    """
+    planned_by_period: dict[str, set[str]] = {}
+    statuses_by_period: dict[str, dict[str, int]] = {}
+    terminal_reporters_by_period: dict[str, set[str]] = {}
+    full_reporters_by_period: dict[str, set[str]] = {}
+    pending_jobs: list[ChunkJob] = []
+
+    for job in jobs:
+        planned_by_period.setdefault(job.period, set()).add(job.reporter_code)
+
+    jobs_by_period_reporter: dict[tuple[str, str], list[ChunkJob]] = {}
+    for job in jobs:
+        jobs_by_period_reporter.setdefault((job.period, job.reporter_code), []).append(job)
+
+        row = get_manifest_row_for_job(manifest, job)
+        status = str(row.get("status")) if row is not None else "not_started"
+        statuses_by_period.setdefault(job.period, {})
+        statuses_by_period[job.period][status] = statuses_by_period[job.period].get(status, 0) + 1
+
+        if status_is_terminal(status):
+            terminal_reporters_by_period.setdefault(job.period, set()).add(job.reporter_code)
+        else:
+            pending_jobs.append(job)
+
+    for (period, reporter), reporter_jobs in jobs_by_period_reporter.items():
+        if all(
+            (row := get_manifest_row_for_job(manifest, j)) is not None
+            and status_is_terminal(row.get("status"))
+            for j in reporter_jobs
+        ):
+            full_reporters_by_period.setdefault(period, set()).add(reporter)
+
+    return {
+        "planned_by_period": planned_by_period,
+        "statuses_by_period": statuses_by_period,
+        "terminal_reporters_by_period": terminal_reporters_by_period,
+        "full_reporters_by_period": full_reporters_by_period,
+        "pending_jobs": pending_jobs,
+    }
+
+
+def log_resume_summary(manifest: pd.DataFrame, jobs: list["ChunkJob"]) -> None:
+    """Log which reporters/chunks have already been looked at from prior runs."""
+    stats = build_resume_stats(manifest, jobs)
+
+    total_chunks = len(jobs)
+    terminal_chunks = 0
+    for job in jobs:
+        row = get_manifest_row_for_job(manifest, job)
+        if row is not None and status_is_terminal(row.get("status")):
+            terminal_chunks += 1
+
+    logger.info(
+        "%d/%d chunks already terminal from previous runs "
+        "(statuses counted as done=%s).",
+        terminal_chunks,
+        total_chunks,
+        sorted(TERMINAL_STATUSES),
+    )
+
+    for period in sorted(stats["planned_by_period"].keys()):
+        planned_reporters = stats["planned_by_period"][period]
+        looked_reporters = stats["terminal_reporters_by_period"].get(period, set())
+        full_reporters = stats["full_reporters_by_period"].get(period, set())
+        status_counts = stats["statuses_by_period"].get(period, {})
+
+        logger.info(
+            "Resume summary period=%s: reporters looked at=%d/%d; "
+            "reporters fully complete=%d/%d; chunk_status_counts=%s",
+            period,
+            len(looked_reporters),
+            len(planned_reporters),
+            len(full_reporters),
+            len(planned_reporters),
+            dict(sorted(status_counts.items())),
+        )
+
+        if looked_reporters:
+            sample = ", ".join(sorted(looked_reporters, key=lambda x: int(x) if str(x).isdigit() else str(x))[:25])
+            extra = "..." if len(looked_reporters) > 25 else ""
+            logger.info(
+                "Reporters already looked at for period=%s: %s%s",
+                period,
+                sample,
+                extra,
+            )
+
+    if stats["pending_jobs"]:
+        nxt = stats["pending_jobs"][0]
+        logger.info(
+            "Next pending chunk appears to be period=%s reporter=%s flow=%s",
+            nxt.period,
+            nxt.reporter_code,
+            nxt.flow_code,
+        )
+    else:
+        logger.info("No pending chunks for the current plan.")
+
+
+
 # ----------------------------------------------------------------------
 # CLEANING / COLUMN NORMALIZATION
 # ----------------------------------------------------------------------
@@ -1142,7 +1273,7 @@ def write_to_mysql(engine, df: pd.DataFrame) -> None:
                 con=conn,
                 if_exists="append",
                 index=False,
-                chunksize=100,
+                chunksize=50,
                 method=mysql_insert_ignore_duplicates,
             )
 
@@ -1206,7 +1337,7 @@ def plan_jobs() -> list[ChunkJob]:
 def main() -> None:
     if not SUBSCRIPTION_KEY:
         raise ValueError(
-            "Missing COMTRADE_SUBSCRIPTION_KEY.  Put it in .env or export it."
+            "Missing COMTRADE_SUBSCRIPTION_KEY. Put it in .env or export it."
         )
 
     budget = load_budget()
@@ -1214,53 +1345,141 @@ def main() -> None:
     engine = get_engine()
 
     jobs = plan_jobs()
+
+    # Progress trackers for this run.
+    total_chunks = len(jobs)
+    total_reporters = len({j.reporter_code for j in jobs})
+    total_reporters_by_period = {}
+    for j in jobs:
+        total_reporters_by_period.setdefault(j.period, set()).add(j.reporter_code)
+
+    attempted_chunks_this_run = 0
+    skipped_chunks_this_run = 0
+    empty_chunks_this_run = 0
+    success_chunks_this_run = 0
+    failed_chunks_this_run = 0
+    seen_reporters_this_run_by_period: dict[str, set[str]] = {}
+
     sinks = []
     if WRITE_MASTER_CSV:
         sinks.append("CSV")
     if LOAD_TO_MYSQL:
         sinks.append("MySQL")
+
     logger.info(
-        "Planned %d chunks  |  cl=%s  freq=%s  cmd=%s  flows=%s  "
-        "partner=%s  sinks=%s  budget_left_today=%d/%d",
-        len(jobs), CL_CODE, FREQ_CODE, CMD_CODE, FLOW_CODES,
+        "Planned %d chunks | reporters=%d | cl=%s freq=%s cmd=%s flows=%s "
+        "partner=%s sinks=%s budget_left_today=%d/%d",
+        total_chunks,
+        total_reporters,
+        CL_CODE,
+        FREQ_CODE,
+        CMD_CODE,
+        FLOW_CODES,
         PARTNER_CODE if PARTNER_CODE else "ALL",
         "+".join(sinks),
-        remaining_budget(budget), MAX_DAILY_CALLS,
+        remaining_budget(budget),
+        MAX_DAILY_CALLS,
     )
 
-    completed = sum(
-        1 for j in jobs
-        if (row := manifest_lookup(manifest, j.manifest_key())) is not None
-        and row.get("status") == "success"
-    )
-    logger.info("%d/%d chunks already completed; resuming.",
-                completed, len(jobs))
+    # Log what the manifest says has already been looked at before this run.
+    log_resume_summary(manifest, jobs)
 
-    for job in jobs:
+    for job_idx, job in enumerate(jobs, 1):
         key = job.manifest_key()
         prior = manifest_lookup(manifest, key)
-        if prior is not None and prior.get("status") == "success":
+
+        # Treat empty as done. Empty chunks already cost an API call.
+        if prior is not None and status_is_terminal(prior.get("status")):
+            skipped_chunks_this_run += 1
+            logger.info(
+                "Skipping completed chunk %d/%d: period=%s reporter=%s flow=%s "
+                "status=%s rows=%s prior_calls=%s updated_at=%s "
+                "| skipped_this_run=%d",
+                job_idx,
+                total_chunks,
+                job.period,
+                job.reporter_code,
+                job.flow_code,
+                prior.get("status"),
+                prior.get("rows", ""),
+                prior.get("n_api_calls", ""),
+                prior.get("updated_at", ""),
+                skipped_chunks_this_run,
+            )
             continue
 
+        # Log reporter progress when we first reach a reporter in this run.
+        period_seen = seen_reporters_this_run_by_period.setdefault(job.period, set())
+        if job.reporter_code not in period_seen:
+            period_seen.add(job.reporter_code)
+
+            stats = build_resume_stats(manifest, jobs)
+            already_looked = stats["terminal_reporters_by_period"].get(job.period, set())
+            fully_complete = stats["full_reporters_by_period"].get(job.period, set())
+            period_total = len(total_reporters_by_period.get(job.period, set()))
+
+            logger.info(
+                "Reporter progress period=%s: reached reporter=%s in this run "
+                "(this_run_reporters_reached=%d; previously_looked_reporters=%d/%d; "
+                "previously_fully_complete_reporters=%d/%d)",
+                job.period,
+                job.reporter_code,
+                len(period_seen),
+                len(already_looked),
+                period_total,
+                len(fully_complete),
+                period_total,
+            )
+
         # If the prior attempt crashed mid-append, clean its rows first.
-        if prior is not None and prior.get("status") in {"in_progress",
-                                                         "truncated_partial"}:
+        if prior is not None and prior.get("status") in {"in_progress", "truncated_partial"}:
             stale_chunk_id = prior.get("chunk_id")
+            logger.info(
+                "Found stale prior chunk: period=%s reporter=%s flow=%s "
+                "status=%s chunk_id=%s. Cleaning stale rows before retry.",
+                job.period,
+                job.reporter_code,
+                job.flow_code,
+                prior.get("status"),
+                stale_chunk_id,
+            )
+
             if stale_chunk_id:
                 removed = remove_chunk_rows_from_master(stale_chunk_id)
                 if removed:
-                    logger.info("Removed %d stale rows from master CSV for "
-                                "chunk_id=%s", removed, stale_chunk_id)
-                removed_db = remove_chunk_rows_from_mysql(
-                    engine, stale_chunk_id
-                )
+                    logger.info(
+                        "Removed %d stale rows from master CSV for chunk_id=%s",
+                        removed,
+                        stale_chunk_id,
+                    )
+
+                removed_db = remove_chunk_rows_from_mysql(engine, stale_chunk_id)
                 if removed_db:
-                    logger.info("Removed %d stale rows from MySQL for "
-                                "chunk_id=%s", removed_db, stale_chunk_id)
+                    logger.info(
+                        "Removed %d stale rows from MySQL for chunk_id=%s",
+                        removed_db,
+                        stale_chunk_id,
+                    )
+
+        elif prior is not None and prior.get("status") == "failed":
+            logger.info(
+                "Retrying previously failed chunk: period=%s reporter=%s flow=%s "
+                "prior_error=%s updated_at=%s",
+                job.period,
+                job.reporter_code,
+                job.flow_code,
+                prior.get("error", ""),
+                prior.get("updated_at", ""),
+            )
 
         if remaining_budget(budget) <= 0:
-            logger.warning("Daily budget reached -- stopping.  "
-                           "Resume tomorrow; manifest will pick up here.")
+            logger.warning(
+                "Daily budget reached before fetching period=%s reporter=%s flow=%s. "
+                "Stopping. Resume later; manifest will pick up here.",
+                job.period,
+                job.reporter_code,
+                job.flow_code,
+            )
             break
 
         chunk_id = uuid.uuid4().hex
@@ -1282,8 +1501,22 @@ def main() -> None:
             "error": "",
         })
 
-        logger.info("Fetching period=%s reporter=%s flow=%s cmd=%s",
-                    job.period, job.reporter_code, job.flow_code, CMD_CODE)
+        attempted_chunks_this_run += 1
+
+        logger.info(
+            "Fetching chunk %d/%d | attempted_this_run=%d skipped_this_run=%d "
+            "| period=%s reporter=%s flow=%s cmd=%s | budget_left_before=%d/%d",
+            job_idx,
+            total_chunks,
+            attempted_chunks_this_run,
+            skipped_chunks_this_run,
+            job.period,
+            job.reporter_code,
+            job.flow_code,
+            CMD_CODE,
+            remaining_budget(budget),
+            MAX_DAILY_CALLS,
+        )
 
         try:
             df_raw, n_calls, subdivided = fetch_chunk(
@@ -1292,46 +1525,95 @@ def main() -> None:
                 flow_code=job.flow_code,
                 budget=budget,
             )
+
         except DailyQuotaExceeded as exc:
             logger.warning("Quota exceeded: %r -- stopping for today.", exc)
             manifest = upsert_manifest(manifest, {
-                "manifest_key": key, "classification": CL_CODE,
-                "frequency": FREQ_CODE, "cmd_code": CMD_CODE,
-                "period": job.period, "reporter_code": job.reporter_code,
+                "manifest_key": key,
+                "classification": CL_CODE,
+                "frequency": FREQ_CODE,
+                "cmd_code": CMD_CODE,
+                "period": job.period,
+                "reporter_code": job.reporter_code,
                 "flow_code": job.flow_code,
                 "partner_code": str(PARTNER_CODE) if PARTNER_CODE else "ALL",
-                "status": "failed", "rows": "0",
-                "n_api_calls": "0", "chunk_id": chunk_id,
+                "status": "failed",
+                "rows": "0",
+                "n_api_calls": "0",
+                "chunk_id": chunk_id,
                 "error": f"DailyQuotaExceeded: {exc!r}"[:480],
             })
+            failed_chunks_this_run += 1
             break
+
+        except KeyboardInterrupt:
+            logger.warning(
+                "KeyboardInterrupt received while fetching period=%s reporter=%s flow=%s. "
+                "Leaving chunk marked in_progress with chunk_id=%s so it can be cleaned/retried next run.",
+                job.period,
+                job.reporter_code,
+                job.flow_code,
+                chunk_id,
+            )
+            raise
+
         except Exception as exc:
-            logger.exception("Chunk failed: period=%s reporter=%s flow=%s",
-                             job.period, job.reporter_code, job.flow_code)
+            logger.exception(
+                "Chunk failed: period=%s reporter=%s flow=%s",
+                job.period,
+                job.reporter_code,
+                job.flow_code,
+            )
             manifest = upsert_manifest(manifest, {
-                "manifest_key": key, "classification": CL_CODE,
-                "frequency": FREQ_CODE, "cmd_code": CMD_CODE,
-                "period": job.period, "reporter_code": job.reporter_code,
+                "manifest_key": key,
+                "classification": CL_CODE,
+                "frequency": FREQ_CODE,
+                "cmd_code": CMD_CODE,
+                "period": job.period,
+                "reporter_code": job.reporter_code,
                 "flow_code": job.flow_code,
                 "partner_code": str(PARTNER_CODE) if PARTNER_CODE else "ALL",
-                "status": "failed", "rows": "0",
-                "n_api_calls": "0", "chunk_id": chunk_id,
+                "status": "failed",
+                "rows": "0",
+                "n_api_calls": "0",
+                "chunk_id": chunk_id,
                 "error": repr(exc)[:480],
             })
+            failed_chunks_this_run += 1
             time.sleep(SLEEP_SECONDS)
             continue
 
         if df_raw is None or df_raw.empty:
             manifest = upsert_manifest(manifest, {
-                "manifest_key": key, "classification": CL_CODE,
-                "frequency": FREQ_CODE, "cmd_code": CMD_CODE,
-                "period": job.period, "reporter_code": job.reporter_code,
+                "manifest_key": key,
+                "classification": CL_CODE,
+                "frequency": FREQ_CODE,
+                "cmd_code": CMD_CODE,
+                "period": job.period,
+                "reporter_code": job.reporter_code,
                 "flow_code": job.flow_code,
                 "partner_code": str(PARTNER_CODE) if PARTNER_CODE else "ALL",
-                "status": "empty", "rows": "0",
+                "status": "empty",
+                "rows": "0",
                 "n_api_calls": str(n_calls),
-                "chunk_id": chunk_id, "error": "",
+                "chunk_id": chunk_id,
+                "error": "",
             })
+
+            empty_chunks_this_run += 1
+
+            logger.info(
+                "  -> empty result | period=%s reporter=%s flow=%s "
+                "calls=%d budget_left=%d/%d | empty_this_run=%d",
+                job.period,
+                job.reporter_code,
+                job.flow_code,
+                n_calls,
+                remaining_budget(budget),
+                MAX_DAILY_CALLS,
+                empty_chunks_this_run,
+            )
+
             time.sleep(SLEEP_SECONDS)
             continue
 
@@ -1339,28 +1621,53 @@ def main() -> None:
         append_to_master(cleaned)
         write_to_mysql(engine, cleaned)
 
+        status = "truncated" if subdivided else "success"
+
         manifest = upsert_manifest(manifest, {
-            "manifest_key": key, "classification": CL_CODE,
-            "frequency": FREQ_CODE, "cmd_code": CMD_CODE,
-            "period": job.period, "reporter_code": job.reporter_code,
+            "manifest_key": key,
+            "classification": CL_CODE,
+            "frequency": FREQ_CODE,
+            "cmd_code": CMD_CODE,
+            "period": job.period,
+            "reporter_code": job.reporter_code,
             "flow_code": job.flow_code,
             "partner_code": str(PARTNER_CODE) if PARTNER_CODE else "ALL",
-            "status": "truncated" if subdivided else "success",
+            "status": status,
             "rows": str(len(cleaned)),
             "n_api_calls": str(n_calls),
             "chunk_id": chunk_id,
             "error": "",
         })
 
+        success_chunks_this_run += 1
+
         logger.info(
-            "  -> %d rows  (calls=%d  budget_left=%d)",
-            len(cleaned), n_calls, remaining_budget(budget),
+            "  -> %s rows=%d calls=%d budget_left=%d/%d | "
+            "success_or_truncated_this_run=%d",
+            status,
+            len(cleaned),
+            n_calls,
+            remaining_budget(budget),
+            MAX_DAILY_CALLS,
+            success_chunks_this_run,
         )
 
         time.sleep(SLEEP_SECONDS)
 
-    logger.info("Run complete.  Calls used today: %d/%d.",
-                budget.get("calls", 0), MAX_DAILY_CALLS)
+    logger.info(
+        "Run complete. Calls used today: %d/%d. This run: attempted=%d, "
+        "skipped_terminal=%d, empty=%d, success_or_truncated=%d, failed=%d.",
+        budget.get("calls", 0),
+        MAX_DAILY_CALLS,
+        attempted_chunks_this_run,
+        skipped_chunks_this_run,
+        empty_chunks_this_run,
+        success_chunks_this_run,
+        failed_chunks_this_run,
+    )
+
+    # Final view of manifest progress after this run.
+    log_resume_summary(load_manifest(), jobs)
 
 
 if __name__ == "__main__":
