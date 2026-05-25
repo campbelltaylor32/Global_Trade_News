@@ -6,12 +6,14 @@ import streamlit as st
 
 from lib import data, features, charts
 from lib.style import (
-    inject_css, kpi_card, caption, section_rule,
+    inject_css, render_sidebar, about_expander,
+    kpi_card, caption, section_rule,
     fmt_money, fmt_pct, fmt_int,
 )
 
-st.set_page_config(page_title="Commodity Explorer", page_icon="🌐", layout="wide")
+st.set_page_config(page_title="Commodity Explorer", page_icon="🌐", layout="wide", initial_sidebar_state="expanded")
 inject_css()
+render_sidebar()
 
 df = data.load_trade()
 commodities = data.list_commodities(df)
@@ -92,7 +94,7 @@ section_rule()
 
 # ─── Market share dynamics ────────────────────────────────────────────────
 st.subheader("Market share dynamics over time")
-caption("Top exporters' share of global trade in this commodity, year over year.")
+caption("How are the top exporters' shares of global trade in this commodity shifting?")
 
 ms_cmd = ms[ms["cmd_code"].astype(str) == code]
 top_exporters = (
@@ -112,8 +114,8 @@ section_rule()
 # ─── Emerging alternatives ────────────────────────────────────────────────
 st.subheader("Emerging alternative suppliers")
 caption(
-    "Countries with the biggest 3-year share gains in this commodity — "
-    "candidate diversification destinations."
+    "Which countries are gaining the most share in this commodity over the "
+    "last 3 years — candidate diversification destinations?"
 )
 
 if year - 3 >= yr_min:
@@ -134,3 +136,71 @@ if year - 3 >= yr_min:
     st.dataframe(show, use_container_width=True, hide_index=True)
 else:
     st.info("Not enough history to compute 3-year share changes.")
+
+# ─── News coverage for this commodity ─────────────────────────────────────
+section_rule()
+st.subheader("News coverage")
+caption(
+    f"Articles tagged to HS chapter {code}. Sentiment and signal columns are "
+    f"populated where the upstream NLP pipeline labeled them."
+)
+
+news = data.load_news()
+cmd_news = features.filter_news(news, cmd_codes=[code])
+
+if cmd_news.empty:
+    st.info("No news articles indexed for this commodity yet.")
+else:
+    # KPIs row
+    nk = features.news_kpis(cmd_news)
+    nc1, nc2, nc3, nc4 = st.columns(4)
+    nc1.markdown(kpi_card("Articles", fmt_int(nk["articles"])), unsafe_allow_html=True)
+    nc2.markdown(kpi_card("Unique stories", fmt_int(nk["unique_stories"]),
+                          delta=f"of {nk['articles']:,} total"), unsafe_allow_html=True)
+    nc3.markdown(kpi_card("With trade signal", fmt_pct(nk["signal_share"], 0)),
+                 unsafe_allow_html=True)
+    nc4.markdown(kpi_card("Distinct sources", fmt_int(nk["sources"])),
+                 unsafe_allow_html=True)
+
+    # Signal mix and timeline side by side
+    nL, nR = st.columns([1, 1.4])
+    with nL:
+        st.markdown("**Signal mix**")
+        sig_df = features.news_signal_mix(cmd_news)
+        st.plotly_chart(charts.signal_bar(sig_df, title=""), use_container_width=True)
+    with nR:
+        st.markdown("**Coverage volume**")
+        ts = features.news_timeline(cmd_news, freq="ME")
+        st.plotly_chart(charts.news_timeline_chart(ts, title=""), use_container_width=True)
+
+    # Top stories (dedup by title)
+    st.markdown("**Most-syndicated stories**")
+    top = features.news_top_stories(cmd_news, n=10)
+    show = top[["title", "syndications", "sources", "trade_signals", "first_seen"]].rename(
+        columns={"title": "Headline", "syndications": "Articles",
+                 "sources": "Sources", "trade_signals": "Signals",
+                 "first_seen": "First seen"}
+    )
+    show["First seen"] = pd.to_datetime(show["First seen"]).dt.strftime("%Y-%m-%d")
+    st.dataframe(show, use_container_width=True, hide_index=True)
+
+# ─── About this page ──────────────────────────────────────────────────────
+section_rule()
+about_expander(
+    primary_question=(
+        "Which countries dominate the global market for specific commodities, "
+        "and where are alternative suppliers emerging?"
+    ),
+    sub_questions=[
+        ("Who are the top exporters of this commodity?",
+         "Choropleth · Top exporters table"),
+        ("How concentrated is global supply (exporter HHI)?",
+         "Exporter HHI KPI · Top-3 share"),
+        ("How is market share shifting among the top players?",
+         "Market share dynamics over time"),
+        ("Which countries are gaining share fastest?",
+         "Emerging alternative suppliers"),
+        ("What is the recent news coverage on this commodity?",
+         "News coverage section"),
+    ],
+)

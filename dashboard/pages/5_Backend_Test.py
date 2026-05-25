@@ -1,181 +1,177 @@
-import streamlit as st
+"""Backend Test — natural-language chat against the trade warehouse.
+
+Talks to a FastAPI service that translates chat messages to SQL and queries
+the warehouse. Visual styling matches the rest of the dashboard (teal accent,
+dark panel backgrounds, IBM Plex Sans).
+"""
+from __future__ import annotations
+
 import requests
+import streamlit as st
 
-API_URL = "http://localhost:8000"
+from lib.style import (
+    inject_css, render_sidebar, caption, section_rule, PALETTE,
+)
 
-st.set_page_config(page_title="Trade AI Analyst", page_icon="🛰️", layout="wide")
+# Backend URL — override via Streamlit secrets [backend] url or env if needed
+try:
+    API_URL = st.secrets["backend"]["url"]
+except Exception:
+    API_URL = "http://localhost:8000"
 
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
+st.set_page_config(
+    page_title="AI Trade Analysis",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+inject_css()
+render_sidebar()
 
-html, body, [class*="css"] {
-    font-family: 'IBM Plex Sans', sans-serif;
-}
+# Page-local CSS — just the bits that aren't covered by the global theme
+st.markdown(
+    f"""
+    <style>
+        /* Status pill */
+        .be-status {{
+            display: inline-flex; align-items: center; gap: 6px;
+            font-size: 0.72rem;
+            padding: 4px 12px;
+            border-radius: 999px;
+            font-weight: 500;
+            margin-bottom: 0.5rem;
+        }}
+        .be-status-ok {{
+            background: rgba(52, 211, 153, 0.10);
+            color: {PALETTE['pos']};
+            border: 1px solid rgba(52, 211, 153, 0.35);
+        }}
+        .be-status-fail {{
+            background: rgba(248, 113, 113, 0.10);
+            color: {PALETTE['neg']};
+            border: 1px solid rgba(248, 113, 113, 0.35);
+        }}
+        .be-status-dot {{
+            width: 6px; height: 6px; border-radius: 50%;
+            background: currentColor;
+        }}
 
-.stApp {
-    background-color: #0a0e17;
-    color: #c9d1d9;
-}
+        /* Chat bubbles */
+        .be-bubble {{
+            border-radius: 10px;
+            padding: 12px 16px;
+            margin: 6px 0 14px 0;
+            font-size: 0.92rem;
+            line-height: 1.55;
+        }}
+        .be-bubble-user {{
+            background: rgba(94, 234, 212, 0.06);
+            border: 1px solid rgba(94, 234, 212, 0.20);
+            color: {PALETTE['text']};
+        }}
+        .be-bubble-assistant {{
+            background: {PALETTE['panel']};
+            border: 1px solid {PALETTE['border']};
+            color: {PALETTE['text']};
+            white-space: pre-wrap;
+            font-family: ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Code", monospace;
+            font-size: 0.85rem;
+        }}
+        .be-role {{
+            font-size: 0.66rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: {PALETTE['text_muted']};
+            font-weight: 600;
+            margin-top: 6px;
+        }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-.title-block {
-    border-left: 3px solid #00e5ff;
-    padding: 0.4rem 1rem;
-    margin-bottom: 1.5rem;
-}
+# ─── Header ────────────────────────────────────────────────────────────────
+st.title("AI Trade Analysis")
+caption(
+    "Natural-language chat against the trade warehouse. Routed through a "
+    "MCP Connector that translates the message, queries MySQL, and returns "
+    "a formatted answer."
+)
 
-.title-block h1 {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 1.4rem;
-    color: #e6edf3;
-    margin: 0;
-    letter-spacing: 0.05em;
-}
-
-.title-block p {
-    font-size: 0.78rem;
-    color: #8b949e;
-    margin: 0.2rem 0 0 0;
-    font-family: 'IBM Plex Mono', monospace;
-}
-
-.status-pill {
-    display: inline-block;
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.72rem;
-    padding: 3px 10px;
-    border-radius: 20px;
-    margin-bottom: 1.5rem;
-}
-
-.status-ok {
-    background: rgba(0, 229, 255, 0.1);
-    color: #00e5ff;
-    border: 1px solid rgba(0, 229, 255, 0.3);
-}
-
-.status-fail {
-    background: rgba(255, 80, 80, 0.1);
-    color: #ff5050;
-    border: 1px solid rgba(255, 80, 80, 0.3);
-}
-
-.chat-bubble-user {
-    background: rgba(0, 229, 255, 0.07);
-    border: 1px solid rgba(0, 229, 255, 0.2);
-    border-radius: 8px;
-    padding: 0.75rem 1rem;
-    margin: 0.5rem 0;
-    font-size: 0.9rem;
-}
-
-.chat-bubble-assistant {
-    background: rgba(255, 255, 255, 0.03);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 8px;
-    padding: 0.75rem 1rem;
-    margin: 0.5rem 0;
-    font-size: 0.9rem;
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.82rem;
-    line-height: 1.6;
-    white-space: pre-wrap;
-}
-
-.label {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.65rem;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: #8b949e;
-    margin-bottom: 4px;
-}
-
-.divider {
-    border: none;
-    border-top: 1px solid rgba(255,255,255,0.06);
-    margin: 1.2rem 0;
-}
-
-/* Override Streamlit input */
-.stTextInput > div > div > input {
-    background: rgba(255,255,255,0.04) !important;
-    border: 1px solid rgba(255,255,255,0.12) !important;
-    color: #e6edf3 !important;
-    font-family: 'IBM Plex Mono', monospace !important;
-    font-size: 0.88rem !important;
-    border-radius: 6px !important;
-}
-
-.stButton > button {
-    background: rgba(0, 229, 255, 0.1) !important;
-    border: 1px solid rgba(0, 229, 255, 0.4) !important;
-    color: #00e5ff !important;
-    font-family: 'IBM Plex Mono', monospace !important;
-    font-size: 0.8rem !important;
-    letter-spacing: 0.05em !important;
-    border-radius: 6px !important;
-    transition: all 0.2s !important;
-}
-
-.stButton > button:hover {
-    background: rgba(0, 229, 255, 0.2) !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# --- Header ---
-st.markdown("""
-<div class="title-block">
-    <h1>🛰️ Trade AI Analyst</h1>
-    <p>FastAPI → OpenAI → GCP MySQL</p>
-</div>
-""", unsafe_allow_html=True)
-
-# --- Health Check ---
+# ─── Health check ──────────────────────────────────────────────────────────
+hc_col, _ = st.columns([1, 4])
+backend_ok = False
+status_html = ""
 try:
     r = requests.get(f"{API_URL}/health", timeout=3)
     if r.status_code == 200:
-        st.markdown('<span class="status-pill status-ok">● BACKEND ONLINE</span>', unsafe_allow_html=True)
+        backend_ok = True
+        status_html = (
+            '<div class="be-status be-status-ok">'
+            '<span class="be-status-dot"></span>Backend online'
+            '</div>'
+        )
     else:
-        st.markdown('<span class="status-pill status-fail">● BACKEND ERROR</span>', unsafe_allow_html=True)
-except Exception:
-    st.markdown('<span class="status-pill status-fail">● BACKEND OFFLINE — is uvicorn running?</span>', unsafe_allow_html=True)
+        status_html = (
+            '<div class="be-status be-status-fail">'
+            f'<span class="be-status-dot"></span>Backend error · HTTP {r.status_code}'
+            '</div>'
+        )
+except requests.exceptions.ConnectionError:
+    status_html = (
+        '<div class="be-status be-status-fail">'
+        '<span class="be-status-dot"></span>Backend offline · is uvicorn running?'
+        '</div>'
+    )
+except Exception as e:
+    status_html = (
+        '<div class="be-status be-status-fail">'
+        f'<span class="be-status-dot"></span>{str(e)[:80]}'
+        '</div>'
+    )
+hc_col.markdown(status_html, unsafe_allow_html=True)
 
-st.markdown('<hr class="divider">', unsafe_allow_html=True)
+section_rule()
 
-# --- Session state ---
+# ─── Chat session state ────────────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# --- Chat history ---
+# ─── Chat history render ───────────────────────────────────────────────────
 for msg in st.session_state.messages:
     if msg["role"] == "user":
-        st.markdown(f'<div class="label">YOU</div><div class="chat-bubble-user">{msg["content"]}</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="be-role">You</div>'
+            f'<div class="be-bubble be-bubble-user">{msg["content"]}</div>',
+            unsafe_allow_html=True,
+        )
     else:
-        st.markdown(f'<div class="label">ASSISTANT</div><div class="chat-bubble-assistant">{msg["content"]}</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="be-role">Assistant</div>'
+            f'<div class="be-bubble be-bubble-assistant">{msg["content"]}</div>',
+            unsafe_allow_html=True,
+        )
 
-# --- Input ---
-col1, col2 = st.columns([6, 1])
-with col1:
+# ─── Input row ─────────────────────────────────────────────────────────────
+in_col, send_col = st.columns([6, 1])
+with in_col:
     user_input = st.text_input(
         label="message",
         label_visibility="collapsed",
-        placeholder="Ask about your trade data, schema, tables...",
-        key="chat_input"
+        placeholder="Ask about the trade data, schema, recent flows, top corridors…",
+        key="chat_input",
     )
-with col2:
-    send = st.button("SEND →")
+with send_col:
+    send = st.button("Send", type="primary", use_container_width=True)
 
 if send and user_input.strip():
     st.session_state.messages.append({"role": "user", "content": user_input})
-
-    with st.spinner(""):
+    with st.spinner("Querying the warehouse…"):
         try:
             resp = requests.post(
                 f"{API_URL}/chat",
                 json={"message": user_input},
-                timeout=30
+                timeout=30,
             )
             resp.raise_for_status()
             answer = resp.json().get("answer", "No response")
@@ -184,23 +180,49 @@ if send and user_input.strip():
         except requests.exceptions.Timeout:
             answer = "❌ Request timed out. The query may have taken too long."
         except Exception as e:
-            answer = f"❌ Error: {str(e)}"
+            answer = f"❌ Error: {e}"
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
     st.rerun()
 
-# --- Clear ---
+# ─── Clear button + Raw inspector ──────────────────────────────────────────
 if st.session_state.messages:
-    st.markdown('<hr class="divider">', unsafe_allow_html=True)
-    if st.button("CLEAR CHAT"):
+    section_rule()
+    if st.button("Clear chat"):
         st.session_state.messages = []
         st.rerun()
 
-# --- Raw request inspector ---
-with st.expander("RAW REQUEST INSPECTOR"):
-    st.markdown('<div class="label">ENDPOINT</div>', unsafe_allow_html=True)
+with st.expander("Raw request inspector"):
+    st.markdown(
+        f'<div style="color:{PALETTE["text_muted"]};font-size:0.7rem;'
+        f"letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px;\">"
+        f"Endpoint</div>",
+        unsafe_allow_html=True,
+    )
     st.code(f"POST {API_URL}/chat", language="bash")
-    st.markdown('<div class="label">PAYLOAD</div>', unsafe_allow_html=True)
+
+    st.markdown(
+        f'<div style="color:{PALETTE["text_muted"]};font-size:0.7rem;'
+        f"letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px;"
+        f'margin-top:0.5rem;">Payload</div>',
+        unsafe_allow_html=True,
+    )
     st.code('{"message": "<your input>"}', language="json")
-    st.markdown('<div class="label">HEALTH CHECK</div>', unsafe_allow_html=True)
+
+    st.markdown(
+        f'<div style="color:{PALETTE["text_muted"]};font-size:0.7rem;'
+        f"letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px;"
+        f'margin-top:0.5rem;">Health check</div>',
+        unsafe_allow_html=True,
+    )
     st.code(f"GET {API_URL}/health", language="bash")
+
+    st.markdown(
+        f'<div style="color:{PALETTE["text_muted"]};font-size:0.78rem;'
+        f'margin-top:0.8rem;">'
+        "Override the URL by adding <code>[backend]</code><br/>"
+        "<code>url = \"https://your-backend\"</code><br/>"
+        "to <code>.streamlit/secrets.toml</code>."
+        "</div>",
+        unsafe_allow_html=True,
+    )
