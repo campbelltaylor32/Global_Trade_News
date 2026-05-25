@@ -217,12 +217,12 @@ if not news.empty:
         "headline-driven risks behind the trade picture above."
     )
 
-    # Top 5 export commodities for the latest year
+    # Top 20 export commodities for the latest year
     top_cmds = (
         features.reporter_commodity_year(df)
         .query("reporter_iso == @iso and ref_year == @year and flow_code == 'X'")
         .sort_values("value", ascending=False)
-        .head(5)
+        .head(20)
     )
 
     if top_cmds.empty:
@@ -260,6 +260,7 @@ if not news.empty:
             news_table,
             use_container_width=True,
             hide_index=True,
+            height=480,
             column_config={
                 "URL": st.column_config.LinkColumn(display_text="open"),
                 "Latest headline": st.column_config.TextColumn(width="large"),

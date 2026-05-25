@@ -194,14 +194,19 @@ if selected_cmd_code is not None and not news.empty:
             col.markdown(
                 f'<div style="background:{PALETTE["panel"]};border:1px solid '
                 f'{PALETTE["border"]};border-radius:10px;padding:12px 14px;'
-                f'height:100%;">'
+                f'height:100%;display:flex;flex-direction:column;">'
                 f'<div style="color:{PALETTE["text_muted"]};font-size:0.72rem;">'
                 f"{date_str} · {row.sources} source{'s' if row.sources != 1 else ''}"
                 f"</div>"
                 f'<a href="{row.url}" target="_blank" '
                 f'style="color:{PALETTE["text"]};font-size:0.88rem;line-height:1.35;'
-                f'text-decoration:none;display:block;margin-top:6px;">{row.title}</a>'
+                f'text-decoration:none;display:block;margin-top:6px;'
+                f'font-weight:500;">{row.title}</a>'
                 f"{sig_html}"
+                f'<a href="{row.url}" target="_blank" '
+                f'style="color:{PALETTE["accent"]};font-size:0.78rem;'
+                f'text-decoration:none;margin-top:auto;padding-top:8px;'
+                f'display:inline-block;font-weight:500;">Read →</a>'
                 f"</div>",
                 unsafe_allow_html=True,
             )

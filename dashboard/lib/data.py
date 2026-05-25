@@ -191,6 +191,7 @@ SELECT
     sentiment,
     trade_signals
 FROM news_articles
+WHERE LOWER(language) = 'english'
 """
 
 
@@ -227,6 +228,10 @@ def _post_process_news(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = df[col].astype("object")
             df.loc[df[col].isna(), col] = None
             df[col] = df[col].where(df[col].notna(), None)
+    # English-only — enforce in code as well as in SQL, so cached parquet
+    # or synthetic data also obeys the rule.
+    if "language" in df.columns:
+        df = df[df["language"].fillna("").astype(str).str.lower() == "english"]
     # Year-month convenience
     df["year_month"] = df["article_date"].dt.to_period("M").astype(str)
     df["year"] = df["article_date"].dt.year
