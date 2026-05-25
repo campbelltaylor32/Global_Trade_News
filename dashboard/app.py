@@ -10,7 +10,8 @@ import streamlit as st
 
 from lib import data, features, charts
 from lib.style import (
-    inject_css, kpi_card, section_rule, caption,
+    inject_css, render_sidebar, hero_banner, about_expander,
+    kpi_card, section_rule, caption,
     fmt_money, fmt_pct, fmt_int,
 )
 
@@ -22,40 +23,65 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 inject_css()
-
-# ─── Sidebar: global filters ───────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("### Global Trade Risk Ledger")
-    st.markdown(
-        '<div style="color:#94A3B8;font-size:0.8rem;margin-top:-8px;">'
-        "ADSP 31011 — UN Comtrade analytics"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("---")
+render_sidebar()
 
 # ─── Load data ─────────────────────────────────────────────────────────────
-df = data.load_trade(year_from=2020, year_to=2024)
+df = data.load_trade()
 yr_min, yr_max = data.year_range(df)
 
-with st.sidebar:
-    year = st.slider(
-        "Reference year", min_value=int(yr_min), max_value=int(yr_max),
-        value=int(yr_max), step=1,
+# ─── Hero ──────────────────────────────────────────────────────────────────
+hero_banner(
+    eyebrow="Global Trade Risk Ledger",
+    title="Global Overview",
+    tagline=(
+        "A look at world trade through two lenses: structural metrics from UN "
+        "Comtrade, and a news signal layer that flags where the headlines are "
+        "concentrating. Start on this page for the big picture, then use the "
+        "left rail to drill in."
+    ),
+    guide_items=[
+        ("Trade Flows",
+         "Where the heaviest corridors are, by commodity and year"),
+        ("Country Profile",
+         "Partners, basket, and dependency for one reporter"),
+        ("Commodity Explorer",
+         "Who dominates a given HS chapter, plus recent coverage"),
+        ("Concentration & Risk",
+         "Structural vs news risk — quadrant view"),
+        ("AI Trade Analysis",
+         "Natural-language chat against the warehouse via MCP Connector"),
+    ],
+    questions=[
+        "Where is the world's trade concentrated, and how is the balance "
+        "of trade shifting?",
+        "Which trade corridors carry the most volume, and which face active "
+        "disruption signals?",
+        "For a given country, which partners and commodities drive its trade, "
+        "and how exposed is it to a single relationship?",
+        "Which countries dominate the global market for specific commodities, "
+        "and where are alternative suppliers emerging?",
+        "Which countries face the highest combined risk from structural "
+        "concentration and current news signals?",
+    ],
+)
+
+# ─── In-body filters ───────────────────────────────────────────────────────
+ff1, ff2, _ = st.columns([1, 1.6, 4])
+with ff1:
+    year = st.selectbox(
+        "Reference year",
+        options=list(range(yr_max, yr_min - 1, -1)),
+        index=0,
     )
+with ff2:
     flow_label = st.radio(
         "Flow", options=["Exports", "Imports", "Total trade"],
-        horizontal=True, index=0,
+        horizontal=True, index=0, label_visibility="visible",
     )
     flow_map = {"Exports": "X", "Imports": "M", "Total trade": "ALL"}
     flow_code = flow_map[flow_label]
 
-# ─── Header ────────────────────────────────────────────────────────────────
-st.title("Global Overview")
-caption(
-    f"State of world trade in {year}. Use the sidebar to switch year and flow direction. "
-    "Switch pages on the left to drill into corridors, countries, and commodities."
-)
+section_rule()
 
 # ─── Top KPIs ──────────────────────────────────────────────────────────────
 cy = features.country_year_wide(df)
@@ -93,7 +119,7 @@ section_rule()
 
 # ─── Choropleth: trade size by country ─────────────────────────────────────
 st.subheader("Where the trade is")
-caption(f"Total {flow_label.lower()} by reporter, {year}.")
+caption(f"Which countries report the largest {flow_label.lower()} in {year}?")
 
 cy_year = features.country_year(df).query("ref_year == @year")
 if flow_code == "ALL":
@@ -140,7 +166,10 @@ section_rule()
 
 # ─── Trade balance leaderboard ─────────────────────────────────────────────
 st.subheader("Largest trade surpluses and deficits")
-caption(f"Net exports = exports − imports, {year}. Positive = surplus.")
+caption(
+    f"Which economies are net exporters, and which run the biggest deficits? "
+    f"Net exports = exports − imports in {year}. Positive = surplus."
+)
 
 bal = cy_now[["reporter_iso", "reporter_desc", "balance"]].copy()
 bal = bal.sort_values("balance")
@@ -165,6 +194,25 @@ glob_ts["value"] = glob_ts["value"] / 2
 st.plotly_chart(
     charts.trade_timeseries(glob_ts, x="ref_year", y="value", color="flow"),
     use_container_width=True,
+)
+
+# ─── About this page ──────────────────────────────────────────────────────
+section_rule()
+about_expander(
+    primary_question=(
+        "Where is the world's trade concentrated, and how is the balance "
+        "of trade shifting?"
+    ),
+    sub_questions=[
+        ("Which countries report the largest exports or imports?",
+         "Where the trade is · Top reporters"),
+        ("Who is growing fastest over the last three years?",
+         "Fastest growing economies"),
+        ("Which countries run the largest surpluses and deficits?",
+         "Largest trade surpluses and deficits"),
+        ("How is global trade trending year over year?",
+         "Global trade over time"),
+    ],
 )
 
 # ─── Footnote ──────────────────────────────────────────────────────────────

@@ -1,8 +1,9 @@
-"""Concentration & Risk — HHI, dependency, and a composite risk score.
+"""Concentration & Risk — HHI, dependency, and composite scores.
 
-This is the page that most directly answers the proposal's resilience question
-*without* the news layer: which countries' trade profiles look fragile based
-on concentration and volatility alone?
+News integration:
+  • Quadrant scatter (#13) — countries plotted on (structural risk, news risk).
+    Quadrants flag "Quietly fragile" (high structural, low news — risk the
+    market isn't pricing) vs "In the storm" (both high — most urgent).
 """
 from __future__ import annotations
 
@@ -11,21 +12,26 @@ import streamlit as st
 
 from lib import data, features, charts
 from lib.style import (
-    inject_css, kpi_card, caption, section_rule,
+    inject_css, render_sidebar, about_expander,
+    kpi_card, caption, section_rule,
     fmt_money, fmt_pct, fmt_int, PALETTE,
 )
 
-st.set_page_config(page_title="Concentration & Risk", page_icon="🌐", layout="wide")
+st.set_page_config(page_title="Concentration & Risk", page_icon="🌐", layout="wide", initial_sidebar_state="expanded")
 inject_css()
+render_sidebar()
 
 df = data.load_trade()
+news = data.load_news()
 yr_min, yr_max = data.year_range(df)
 
 st.title("Concentration & Risk")
 caption(
-    "Resilience signals based on trade structure alone — concentration across "
-    "partners and commodities, and volatility of trade. "
-    "Higher score → more exposure to a single relationship or shock."
+    "Resilience signals for trade structure. Structural metrics come from "
+    "concentration across partners and commodities and from volatility of "
+    "trade. The news layer comes from per-commodity coverage volume, "
+    "disruption signals, and sentiment, weighted to each country by its "
+    "export basket."
 )
 
 # ─── Filters ──────────────────────────────────────────────────────────────
@@ -37,13 +43,81 @@ with f2:
                           horizontal=True, index=0)
 flow_code = "X" if flow_label == "Exports" else "M"
 
+# ─── Quadrant scatter (NEW — structural vs news) ──────────────────────────
+if not news.empty:
+    st.subheader("Structural risk vs news risk")
+    caption(
+        "Each dot is a country. Horizontal: structural risk (concentration + "
+        "volatility, 0–100). Vertical: news risk (export-share-weighted "
+        "average of commodity-level news risk, 0–100). Dotted lines mark the "
+        "medians; quadrants are labeled in each corner."
+    )
+
+    quad = features.structural_vs_news(df, news, flow=flow_code, year=year)
+    if quad.empty:
+        st.info("Not enough overlap between trade and news data to plot.")
+    else:
+        st.plotly_chart(
+            charts.risk_quadrant_scatter(
+                quad,
+                x="structural_risk", y="news_risk_score",
+                name="reporter_desc",
+                size="articles",
+                x_label="Structural risk (0–100)",
+                y_label="News risk (0–100)",
+            ),
+            use_container_width=True,
+        )
+
+        # Tabular summary of each quadrant
+        with st.expander("Countries by quadrant", expanded=False):
+            x_med = quad["structural_risk"].median()
+            y_med = quad["news_risk_score"].median()
+
+            def q_of(r):
+                if r["structural_risk"] >= x_med and r["news_risk_score"] >= y_med:
+                    return "In the storm"
+                if r["structural_risk"] >= x_med and r["news_risk_score"] < y_med:
+                    return "Quietly fragile"
+                if r["structural_risk"] < x_med and r["news_risk_score"] >= y_med:
+                    return "Noisy but resilient"
+                return "Stable"
+
+            q = quad.copy()
+            q["Quadrant"] = q.apply(q_of, axis=1)
+            cq1, cq2 = st.columns(2)
+            for col, label in zip(
+                [cq1, cq1, cq2, cq2],
+                ["In the storm", "Quietly fragile",
+                 "Noisy but resilient", "Stable"],
+            ):
+                rows = q[q["Quadrant"] == label].sort_values(
+                    "news_risk_score" if "news" in label.lower() else "structural_risk",
+                    ascending=False,
+                )
+                col.markdown(f"**{label}** ({len(rows)})")
+                show = rows[["reporter_desc", "structural_risk",
+                             "news_risk_score", "articles",
+                             "top_cmd_desc"]].copy()
+                show = show.rename(columns={
+                    "reporter_desc": "Country",
+                    "structural_risk": "Struct.",
+                    "news_risk_score": "News",
+                    "articles": "Articles",
+                    "top_cmd_desc": "Top export",
+                })
+                show["Struct."] = show["Struct."].map(lambda v: f"{v:.0f}")
+                show["News"] = show["News"].map(lambda v: f"{v:.0f}")
+                col.dataframe(show, use_container_width=True, hide_index=True)
+
+    section_rule()
+
 # ─── Risk score table ─────────────────────────────────────────────────────
 score = features.concentration_risk_score(df)
 pc = features.partner_concentration(df, flow=flow_code).query("ref_year == @year")
 cc = features.commodity_concentration(df, flow=flow_code).query("ref_year == @year")
 
-# Latest snapshot — composite computed from the full panel, so it's a single view
-st.subheader("Composite risk score (top 15)")
+st.subheader("Composite structural risk score (top 15)")
 caption(
     "Composite = 0.45·partner HHI (rank) + 0.35·commodity HHI (rank) + 0.20·YoY "
     "volatility (rank). Descriptive, not predictive."
@@ -94,7 +168,7 @@ left, right = st.columns(2)
 
 with left:
     st.subheader("Most partner-dependent")
-    caption("Highest share of trade going to a single top-1 partner.")
+    caption("Which countries rely most heavily on a single top partner?")
     deps = pc.nlargest(10, "top1_share")[
         ["reporter_desc", "top1_share", "n_partners", "effective_partners"]
     ].copy()
@@ -107,7 +181,7 @@ with left:
 
 with right:
     st.subheader("Most diversified")
-    caption("Lowest partner HHI — broadest trading base.")
+    caption("Which countries have the broadest trading base (lowest partner HHI)?")
     div = pc.nsmallest(10, "hhi")[
         ["reporter_desc", "hhi", "effective_partners", "n_partners"]
     ].copy()
@@ -120,6 +194,26 @@ with right:
 
 section_rule()
 
+# ─── About this page ──────────────────────────────────────────────────────
+about_expander(
+    primary_question=(
+        "Which countries face the highest combined risk from structural "
+        "concentration and current news signals?"
+    ),
+    sub_questions=[
+        ("Which countries are structurally most fragile?",
+         "Composite structural risk score · top 15"),
+        ("How do structural risk and news pressure intersect?",
+         "Structural risk vs news risk · quadrant chart"),
+        ("How does concentration split between partners and commodities?",
+         "Concentration map: partners vs commodities"),
+        ("Which countries are most dependent on a single partner?",
+         "Most partner-dependent"),
+        ("Which countries have the most diversified trade base?",
+         "Most diversified"),
+    ],
+)
+
 # ─── Glossary ─────────────────────────────────────────────────────────────
 with st.expander("How to read these metrics"):
     st.markdown(
@@ -130,8 +224,12 @@ with st.expander("How to read these metrics"):
 - **Effective partners** — `1 / Σ(share²)`. The number of equal-sized
   partners that would yield the same HHI. Smaller = more concentrated.
 - **YoY volatility** — standard deviation of year-over-year growth in total trade.
-- **Composite risk score** — a weighted, rank-based combination of the above.
-  Purely structural; no event or news data is used. *Future Risk Overlay page
-  will combine this with GDELT/News tone signals.*
+- **Composite structural risk** — weighted, rank-based combination of the
+  three structural metrics above. Trade-data only.
+- **News risk (quadrant chart)** — export-share-weighted average of
+  per-commodity news risk for that country. News risk per commodity =
+  40% rank(log article volume) + 40% rank(disruption-signal share) +
+  20% rank(negative-sentiment share). Commodities with no news coverage
+  receive a neutral 50 (otherwise uncovered countries score as "safe").
         """
     )
