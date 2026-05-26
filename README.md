@@ -13,9 +13,9 @@ It builds an end-to-end pipeline that turns two open data sources into one wareh
 1. **UN Comtrade** — every reporter country's monthly/annual imports and exports, drilled down to 6-digit HS commodity codes, every bilateral partner, every transport mode.
 2. **GDELT** — news articles and CAMEO-coded geopolitical events that mention those commodities, scored for sentiment and trade-relevant signals (tariffs, sanctions, embargoes, weather, strikes, etc.).
 
-The two sides join cleanly on `cmd_code × period`, so for any HS chapter in any month you can ask: *how did trade volume move, and what was the world saying about it?*
+The two sides join cleanly on `cmd_code`, so for any HS chapter in any month you can ask: *how did trade volume move, and what was the world saying about it?*
 
-A multi-page Streamlit dashboard sits on top of the warehouse for executive-style exploration: corridors, country profiles, commodity market share, concentration risk, and a small FastAPI/OpenAI chat backend for natural-language schema queries.
+A multi-page Streamlit dashboard sits on top of the warehouse for executive-style exploration: corridors, country profiles, commodity market share, concentration risk, and a small FastAPI/OpenAI chat MCP connection backend for natural-language schema queries.
 
 ---
 
@@ -51,7 +51,7 @@ A multi-page Streamlit dashboard sits on top of the warehouse for executive-styl
                                                     ▼
                                 ┌───────────────────────────────────┐
                                 │     Streamlit dashboard +         │
-                                │     FastAPI chat backend          │
+                                │     FastAPI chat MCP backend          │
                                 └───────────────────────────────────┘
 ```
 
@@ -122,6 +122,7 @@ Global_Trade_News/
 │
 ├── notebooks/                      <- exploratory analyses
 │   └── eda.ipynb
+│   └── full_eda.ipynb
 │
 ├── comtrade_output/                <- loader artifacts (gitignored going forward)
 ├── output/                         <- legacy news-collector artifacts (gitignored)
@@ -261,7 +262,7 @@ SELECT
     n.avg_sentiment,
     n.signal_tariff,
     n.signal_sanction
-FROM fact_trade_granular f
+FROM fact_trade_granular_v2 f
 LEFT JOIN news_linking n
     ON n.cmd_code = f.cmd_code
    AND n.period   = f.period;
@@ -269,7 +270,7 @@ LEFT JOIN news_linking n
 
 ---
 
-## Operational concerns
+## Additional Operational Information
 
 ### Comtrade rate limits
 
@@ -311,7 +312,7 @@ Each output directory contains:
 | **Country Profile** | How exposed is country X to its top partners? What's its commodity basket and how is it shifting? |
 | **Commodity Explorer** | Who dominates global trade in a given HS chapter? Where are alternative suppliers emerging? |
 | **Concentration & Risk** | Which countries look fragile from a structural-trade standpoint (HHI + volatility)? |
-| **Backend Chat Test** | Natural-language schema/data queries via FastAPI + OpenAI. |
+| **AI Trade Analysis** | Natural-language schema/data queries via FastAPI + OpenAI + MCP. |
 
 Concentration risk metrics: partner HHI, top-N share, effective partners, commodity HHI, YoY volatility, and a rank-based composite score. None of these use the news layer yet — adding a "Risk Overlay" page that combines structural concentration with GDELT tone is the obvious next step.
 
@@ -370,9 +371,7 @@ streamlit run app.py
 
 ## Known limitations and next steps
 
-- The dashboard does not yet overlay the `news_linking` rollup onto the trade pages. A "Risk Overlay" page combining structural HHI + GDELT tone is the natural next deliverable.
 - Comtrade returns occasional reporter/HS codes that the published mapping CSVs don't include (new HS revisions, "Areas, n.e.s."). They're inserted as placeholders; refresh the mapping CSVs periodically.
-- The single-file `legacy/comtrade_streamlitapp.py` is preserved for reference but is not maintained alongside the multi-page version.
 - Strict attribution in the news loader resolves multi-commodity articles to one `cmd_code`. The runner-up is preserved, but a soft-attribution (weighted) variant could be added if multi-cmd analyses become important.
 
 ---
